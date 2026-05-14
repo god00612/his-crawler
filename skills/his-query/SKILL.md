@@ -547,6 +547,136 @@ Brain MRI（2026-05-10）
 
 ---
 
+### 情境十三：全病房掃描 — 呼吸器病人 + 最近 CXR
+
+**目標**：一次列出整個病房所有使用呼吸器的病人，並附上各人最近一張 CXR。
+
+**步驟**：
+
+**Phase 1 — 取病房名單與 visitNo**（Chrome MCP UI 操作或用快取表）
+
+**Phase 2 — 並行掃描，篩呼吸器病人**：
+```javascript
+(async () => {
+  const patients = [
+    {bed:'MI01',visitNo:33958572,name:'王OO'},
+    // ... 其他病人
+  ];
+  const results = await Promise.all(patients.map(async pt => {
+    const data = await fetch(
+      `https://hapi.csh.org.tw/patient_treatments?visitNo=${pt.visitNo}`,
+      {credentials:'include'}).then(r=>r.json());
+    const hasVent = data.some(t =>
+      t.ItemName?.includes('呼吸補助使用費') || t.ItemName?.includes('呼吸器'));
+    return {...pt, hasVent};
+  }));
+  window._ventPts = results.filter(r => r.hasVent);
+  return window._ventPts.map(p => p.bed + ' ' + p.name);
+})();
+```
+
+**Phase 3 — 取各呼吸器病人的 chartno**：
+```javascript
+(async () => {
+  const infos = await Promise.all(window._ventPts.map(async pt => {
+    const info = await fetch(
+      `https://hapi.csh.org.tw/patient_info?visitNo=${pt.visitNo}`,
+      {credentials:'include'}).then(r=>r.json());
+    return {...pt, chartno: info.ChartNo};
+  }));
+  window._ventPts = infos;
+  return infos.map(p => `${p.bed} chartno=${p.chartno}`);
+})();
+```
+
+**Phase 4 — 取各人最近 CXR 的 sop_instance_uid**：
+```javascript
+(async () => {
+  const cxrList = await Promise.all(window._ventPts.map(async pt => {
+    const studies = await fetch(
+      `https://hapi.csh.org.tw/get_oracle_pacs_study_list?chartno=${pt.chartno}`,
+      {credentials:'include'}).then(r=>r.json());
+    const latest = studies
+      .filter(s => /chest|cxr|胸部/i.test(s.StudyDesc))
+      .sort((a,b) => b.StudyDateTime.localeCompare(a.StudyDateTime))[0];
+    if (!latest) return {...pt, uid: null};
+    const imgs = await fetch(
+      `https://hapi.csh.org.tw/get_pacs_images?chartno=${pt.chartno}&dt=${latest.StudyDateTime.slice(0,10)}`,
+      {credentials:'include'}).then(r=>r.json());
+    return {...pt, cxrDate: latest.StudyDateTime.slice(0,10), uid: imgs[0]?.sop_instance_uid};
+  }));
+  window._cxrList = cxrList.filter(p => p.uid);
+  return window._cxrList.map(p => `${p.bed} ${p.cxrDate} ${p.uid}`);
+})();
+```
+
+**Phase 5 — PowerShell 下載所有 CXR（根據 Phase 4 輸出的 uid 清單）**：
+```powershell
+$patients = @(
+  @{bed="MI01"; uid="1.2.392..."},
+  @{bed="MI03"; uid="1.2.392..."}
+)
+foreach ($pt in $patients) {
+  $url = "https://pacs.csh.org.tw/WebPush/WebPush.dll?PushWADO?requestType=WADO&contentType=image/jpeg&objectUID=$($pt.uid)&rows=640"
+  $resp = Invoke-WebRequest -Uri $url -UseBasicParsing
+  [System.IO.File]::WriteAllBytes("D:\Users\YUAN\Desktop\his_crawler\tmp_cxr_$($pt.bed).jpg", $resp.Content)
+}
+```
+
+**Phase 6 — 逐一 `Read` tool 呈現**，每張標上床位與日期。
+
+---
+
+### 情境十四：全病房掃描 — 特定呼吸支持模式（BIPAP / HFNC）
+
+**目標**：列出病房中使用 BIPAP（57023）或 HFNC（57030、57031）的病人。
+
+**掃描方式**（同情境十三 Phase 1–2，改篩條件）：
+
+```javascript
+(async () => {
+  const patients = [
+    {bed:'CCU01', visitNo:XXXXXXXX},
+    // ... CCU 全部病人
+  ];
+  const TARGET_CODES = ['57023', '57030', '57031'];
+  const TARGET_NAMES = ['BIPAP', 'HFNC', '高流量'];
+
+  const results = await Promise.all(patients.map(async pt => {
+    const data = await fetch(
+      `https://hapi.csh.org.tw/patient_treatments?visitNo=${pt.visitNo}`,
+      {credentials:'include'}).then(r=>r.json());
+    const hits = data.filter(t =>
+      TARGET_CODES.some(c => t.ItemCode === c) ||
+      TARGET_NAMES.some(n => t.ItemName?.includes(n))
+    );
+    return {...pt, hits: hits.map(t=>t.ItemName)};
+  }));
+
+  return results
+    .filter(r => r.hits.length > 0)
+    .map(r => `${r.bed}: ${r.hits.join(', ')}`);
+})();
+```
+
+> ⚠️ **待確認**：57023（BIPAP）、57030、57031（HFNC）是否在 `patient_treatments` 中，還是在 `patient_orders` 中？回醫院後用模式 A（選病人攔截）確認這些代碼出現在哪個 API、欄位名稱為何（`ItemCode`？`OrderCode`？）。
+
+**呈現格式**：
+```
+CCU 呼吸支持現況（2026-05-14）
+
+使用呼吸器：
+  CCU01 王OO、CCU05 李OO
+
+使用 BIPAP（57023）：
+  CCU03 張OO
+
+使用 HFNC（57030/57031）：
+  CCU07 陳OO、CCU09 林OO
+```
+
+---
+
 ## Token 過期處理
 
 症狀：查詢回傳 `"無法載入 XX 病房名單"`

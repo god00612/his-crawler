@@ -82,6 +82,191 @@ data = json.loads(result.stdout.decode('utf-8'))
 - **`get_nursing_records?visitNo=` 回傳完整住院史**（非只有當班）。直接用 `?visitNo=` fetch 後自行篩選日期即可，不需 encrypted URL。
 - **`交班紀錄` = 醫師交班**。是 `get_medSummary` API 的回傳，不是藥物摘要。
 
+## 臨床情境 SOP
+
+常見臨床問題的標準查詢流程。每個情境列出：需要哪些 API、怎麼篩選、怎麼呈現。
+
+---
+
+### 情境一：CXR 比較（最新兩張）
+
+**目標**：取得病人最近兩次胸部 X 光，依序呈現在對話中供比較。
+
+**步驟**：
+
+1. 取得 `chartno`：
+   ```javascript
+   const info = await fetch('https://hapi.csh.org.tw/patient_info?visitNo=XXXXXXXX',
+     {credentials:'include'}).then(r=>r.json());
+   const chartno = info.ChartNo;
+   ```
+
+2. 取影像清單，篩出最近兩次 CXR：
+   ```javascript
+   const studies = await fetch(
+     `https://hapi.csh.org.tw/get_oracle_pacs_study_list?chartno=${chartno}`,
+     {credentials:'include'}).then(r=>r.json());
+   // 識別 CXR：StudyDesc 含 "Chest"、"CXR"、"胸部"
+   const cxrs = studies
+     .filter(s => /chest|cxr|胸部/i.test(s.StudyDesc))
+     .sort((a,b) => b.StudyDateTime.localeCompare(a.StudyDateTime))
+     .slice(0, 2);
+   JSON.stringify(cxrs.map(s=>({date:s.StudyDateTime.slice(0,10), desc:s.StudyDesc})));
+   ```
+
+3. 各取一個 `sop_instance_uid`（對兩個日期各執行一次）：
+   ```javascript
+   const imgs = await fetch(
+     `https://hapi.csh.org.tw/get_pacs_images?chartno=${chartno}&dt=2026-05-13`,
+     {credentials:'include'}).then(r=>r.json());
+   imgs[0].sop_instance_uid
+   ```
+
+4. PowerShell 下載兩張 JPEG（WADO 不需 cookie）：
+   ```powershell
+   foreach ($i in 1..2) {
+     $uid = "..."  # 各自的 sop_instance_uid
+     $url = "https://pacs.csh.org.tw/WebPush/WebPush.dll?PushWADO?requestType=WADO&contentType=image/jpeg&objectUID=$uid&rows=640"
+     $resp = Invoke-WebRequest -Uri $url -UseBasicParsing
+     [System.IO.File]::WriteAllBytes("D:\Users\YUAN\Desktop\his_crawler\tmp_cxr_$i.jpg", $resp.Content)
+   }
+   ```
+
+5. 用 `Read` tool 依序讀取 `tmp_cxr_1.jpg`、`tmp_cxr_2.jpg`，各加上日期與 StudyDesc 說明。
+
+**呈現格式**：
+```
+【第一張】2026-05-11 Chest AP
+[影像]
+
+【第二張】2026-05-13 Chest AP
+[影像]
+```
+
+---
+
+### 情境二：升壓劑 / 鎮靜劑現況
+
+**目標**：知道病人目前使用什麼升壓劑和鎮靜劑、速率多少、最後記錄時間。
+
+**步驟**：
+
+1. 取今日護理班務記錄：
+   ```javascript
+   window._nursing = null;
+   fetch('https://hapi.csh.org.tw/get_nursing_records?visitNo=XXXXXXXX',
+     {credentials:'include'}).then(r=>r.json()).then(d=>{window._nursing=d;});
+   // 等完成後篩今日班務記錄
+   (() => {
+     const today = '2026-05-14';
+     return window._nursing
+       .filter(r => r.RecordTime.startsWith(today) && r.RecordTypeName?.includes('班務'))
+       .sort((a,b) => b.RecordTime.localeCompare(a.RecordTime))
+       .map(r => `[${r.RecordTime.slice(11,16)}] ${r.Content}`);
+   })()
+   ```
+
+2. 在回傳的自由文字中搜尋關鍵字：
+
+   | 類型 | 關鍵字 |
+   |---|---|
+   | 升壓劑 | norepinephrine、epinephrine、dopamine、vasopressin、levophed |
+   | 鎮靜劑 | fentanyl、midazolam、propofol、dexmedetomidine、precedex |
+   | 速率格式 | `X ml/hr`、`X mcg/kg/min` |
+
+3. 交叉確認有無開立（看 `patient_drugs?visitNo=`）。
+
+**呈現格式**：
+```
+升壓劑：
+  Norepinephrine 5 ml/hr（記錄於 14:30）
+
+鎮靜劑：
+  Fentanyl 2 ml/hr（記錄於 14:30）
+  Midazolam 3 ml/hr（記錄於 14:30）
+```
+
+> ⚠️ pump 速率在護理**班務記錄**自由文字，`get_pump_records` 通常為空。
+
+---
+
+### 情境三：培養菌種
+
+**目標**：確認病人有無培養出菌、菌種為何、藥敏結果。
+
+**步驟**：
+
+1. 取累積檢驗，篩培養類（TranCode:"8"）：
+   ```javascript
+   window._lab = null;
+   fetch('https://hapi.csh.org.tw/query_cumulative_lab_data?visitNo=XXXXXXXX',
+     {credentials:'include'}).then(r=>r.json()).then(d=>{window._lab=d;});
+   // 等完成後篩培養
+   (() => {
+     const cultures = window._lab.filter(d => d.TranCode === '8');
+     return cultures.map(d => ({
+       date: (d.LabDate||'').slice(0,10),
+       specimen: d.SpecimenCode,
+       item: d.Item,
+       report: d.ReportText,
+       abnormal: d.IsAbnormal
+     }));
+   })()
+   ```
+
+2. 按檢體分類：
+
+   | SpecimenCode | 檢體 |
+   |---|---|
+   | BLD | 血液 |
+   | UR | 尿液 |
+   | SPT | 痰液 |
+   | 其他 | 依 Item 名稱判斷 |
+
+3. 判斷有無長菌：`ReportText` 含菌種名稱（非 "No growth" / "陰性"）即為陽性。
+
+**呈現格式**：
+```
+血液培養（2026-05-10）：No growth
+痰液培養（2026-05-12）：Klebsiella pneumoniae ⚠
+  藥敏報告：[ReportText 完整內容]
+尿液培養：本次住院無送檢紀錄
+```
+
+---
+
+### 情境四：醫師治療計劃
+
+**目標**：了解醫師目前的治療方向與計劃。
+
+**步驟**：
+
+1. 取醫師交班紀錄（目前最接近 progress note 的資料）：
+   ```javascript
+   const data = await fetch('https://hapi.csh.org.tw/get_medSummary?visitNo=XXXXXXXX',
+     {credentials:'include'}).then(r=>r.json());
+   // 最近 3 筆
+   JSON.stringify(data.slice(-3).map(d=>({
+     time: d.RecordTime,
+     type: d.ProgressType,
+     doctor: d.RecordUser,
+     content: d.Summary
+   })));
+   ```
+
+**呈現格式**：
+```
+【2026-05-14 08:00】主治醫師 王OO（白班交班）
+[Summary 內容]
+
+【2026-05-13 20:00】主治醫師 王OO（小夜交班）
+[Summary 內容]
+```
+
+> ⚠️ **待確認**：`get_medSummary` 是交班紀錄，不一定等於完整治療計劃。回醫院後確認是否有更接近 progress note 的 API。
+
+---
+
 ## Token 過期處理
 
 症狀：查詢回傳 `"無法載入 XX 病房名單"`

@@ -1593,7 +1593,7 @@ summary.filter(s => /氣切|tracheostomy|家屬|consent|DNR|RCW/i.test(s.Summary
 | 資料 | 來源 | 狀態 |
 |---|---|---|
 | 累計 I/O | `get_io?visitNo=` | ⚠️ API 格式待確認 |
-| CVP | `get_vital_sign` 或護理班務記錄 | ⚠️ 需確認 CVP 是否在 vital sign API |
+| CVP | 護理**班務記錄**自由文字 | ✓ 有記錄（解析關鍵字 CVP） |
 | RSBI (f/Vt) | 護理紀錄自由文字 | 需確認是否有記錄 |
 
 **RSBI 從護理紀錄解析**（format 待確認）：
@@ -1607,15 +1607,30 @@ window._nursing
   });
 ```
 
-**趨勢圖（matplotlib，待 I/O 和 CVP 資料確認後補完）**：
-```python
-# 三天資料繪製：
-# 上圖：每日 I/O 平衡（正值=液體過多, 負值=液體不足）
-# 中圖：CVP 走勢
-# 下圖：RSBI（<105 = 可能可脫離）
+**CVP 從護理班務記錄解析**：
+```javascript
+// CVP 記錄在班務自由文字，格式如 "CVP: 12 cmH2O" 或 "CVP 8"
+window._nursing
+  .filter(r => r.RecordTypeName?.includes('班務') && /CVP/i.test(r.Content||''))
+  .sort((a,b)=>a.RecordTime.localeCompare(b.RecordTime))
+  .map(r => {
+    const m = r.Content.match(/CVP[:\s]*([\d.]+)/i);
+    return {date: r.RecordTime.slice(0,10), time: r.RecordTime.slice(11,16),
+            cvp: m ? parseFloat(m[1]) : null};
+  }).filter(r=>r.cvp);
 ```
 
-> ⚠️ 此情境高度依賴 `get_io` 和 CVP 資料來源，回醫院確認後補完。
+**趨勢圖（matplotlib）**：
+```python
+# 三天資料繪製：
+# 上圖：每日 I/O 平衡（I/O API 確認後補值）
+# 中圖：CVP 走勢（從護理記錄解析）
+# 下圖：RSBI（<105 = 可能可脫離）
+import matplotlib.pyplot as plt
+# ... 同情境十六的繪圖模式
+```
+
+> ⚠️ I/O 部分仍待 `get_io` API 確認；CVP 和 RSBI 從護理紀錄解析已可行。
 
 ---
 
@@ -1731,24 +1746,47 @@ tx.filter(t => /物理治療|PT|胸腔|chest.*physio|呼吸治療/i.test(t.ItemN
 
 **目標**：PEEP 調降或 SBT 期間，偵測 PVC、心跳過速、MAP 掉落 > 20%。
 
-> ⚠️ **高難度情境**：需要時序精確的心律/MAP 資料，目前有以下限制：
+**查詢策略（先廣後深）**：
 
-**可行部分（護理紀錄）**：
+護理紀錄 + 醫師交班已足以掌握大概——護理師會記錄心律不整事件、呼叫醫師的過程；醫師交班會記載血動力學變化與處置決策。
+
+**第一層 — 護理紀錄（SBT 時間窗）**：
 ```javascript
-// 找 SBT 期間護理記錄的異常描述
-const sbtTime = '2026-05-14T09:00';  // SBT 開始時間
-const from = sbtTime;
-const to   = '2026-05-14T10:00';
+const from = '2026-05-14T09:00';  // SBT 開始
+const to   = '2026-05-14T10:00';  // SBT 結束
 window._nursing
   .filter(r => r.RecordTime >= from && r.RecordTime <= to &&
-    /PVC|心律|arrhythmia|心跳過速|tachycardia|MAP|血壓下降|PEEP/i.test(r.Content||''))
-  .map(r=>`[${r.RecordTime.slice(11,16)}] ${r.Content}`);
+    /PVC|心律|arrhythmia|心跳過速|tachycardia|MAP|血壓下降|PEEP|SBT|脫離/i
+    .test(r.Content||''))
+  .sort((a,b)=>a.RecordTime.localeCompare(b.RecordTime))
+  .map(r=>`[${r.RecordTime.slice(11,16)}] ${r.RecordTypeName}: ${r.Content}`);
 ```
 
-**待確認**：
-- `get_vital_sign` 是否有足夠時間解析度記錄 MAP 變化？
-- PVC/心律不整是否有獨立的心電圖/telemetry API？
-- 若上述均無，則此情境只能從護理自由文字間接判斷
+**第二層 — 醫師交班（當日 SBT 結果紀錄）**：
+```javascript
+const summary = await fetch(`https://hapi.csh.org.tw/get_medSummary?visitNo=XXXXXXXX`,
+  {credentials:'include'}).then(r=>r.json());
+summary
+  .filter(s => s.RecordTime.startsWith('2026-05-14') &&
+    /SBT|脫離|PEEP|PVC|心律|MAP|hemodynamic/i.test(s.Summary||''))
+  .map(s=>`[${s.RecordTime}] ${s.RecordUser}: ${s.Summary}`);
+```
+
+**呈現格式**：
+```
+SBT 期間心肺交互監測（09:00–10:00）
+
+護理記錄事件：
+  [09:15] 班務 護士A：SBT 開始，PS 8/PEEP 5
+  [09:30] 緊急 護士A：心跳升至 118，MAP 由 85 降至 62（↓27%）⚠
+  [09:32] 護士A：通知醫師，重新接回原設定
+  [09:40] 班務 護士A：HR 回降至 88，MAP 回升至 80
+
+醫師交班記載：
+  「SBT 失敗，主因血動力學不穩（MAP drop > 20%），建議心臟超音波評估。」
+
+結論：此次 SBT 因心肺交互作用失敗，需進一步評估心功能。
+```
 
 ---
 

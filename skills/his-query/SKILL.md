@@ -816,6 +816,174 @@ MI06 小夜班特殊處置（2026-05-14 15:00–23:00）
 
 ---
 
+### 情境十八：全病房 CXR 影像判讀篩查（氣胸等）
+
+**目標**：下載全病房最新 CXR，由 Claude 視覺判讀，回報有異常發現的病人。
+
+> ⚠️ **重要聲明**：Claude 的影像判讀為**輔助篩查**，不能取代放射科醫師診斷。發現可疑異常時，需請醫師確認。
+
+**步驟**：
+
+**Phase 1–4**：同情境十三（全病房掃描取 CXR），取得所有病人的 `sop_instance_uid`
+
+**Phase 5 — PowerShell 批次下載**：
+```powershell
+$cxrList = @(
+  @{bed="MI01"; uid="1.2.392..."},
+  @{bed="MI03"; uid="1.2.392..."}
+  # ... 從 Phase 4 輸出填入
+)
+foreach ($pt in $cxrList) {
+  $url = "https://pacs.csh.org.tw/WebPush/WebPush.dll?PushWADO?requestType=WADO&contentType=image/jpeg&objectUID=$($pt.uid)&rows=640"
+  $resp = Invoke-WebRequest -Uri $url -UseBasicParsing
+  [System.IO.File]::WriteAllBytes(
+    "D:\Users\YUAN\Desktop\his_crawler\tmp_cxr_$($pt.bed).jpg", $resp.Content)
+}
+```
+
+**Phase 6 — Claude 逐張判讀**：
+用 `Read` tool 讀取每張 JPG，描述：
+- 有無氣胸跡象（肺紋消失、胸膜線、縱膈移位）
+- 有無大量肋膜積液
+- 其他明顯異常（新發浸潤、心臟擴大等）
+
+**呈現格式**：
+```
+MI 病房 CXR 篩查（2026-05-14）
+
+MI01 王OO [2026-05-13]：
+  ⚠️ 左側疑似氣胸——左上肺野肺紋稀少，建議確認
+
+MI03 張OO [2026-05-14]：
+  兩側浸潤，無明顯氣胸
+
+MI05 李OO [2026-05-12]：
+  右側少量肋膜積液，無氣胸
+
+---
+⚠️ 以上為 AI 輔助篩查，請醫師確認後判讀。
+```
+
+**常見氣胸判讀線索**：
+- 肺紋（lung markings）消失的區域
+- 可見胸膜線（visceral pleural line）
+- 縱膈向對側移位（張力性氣胸）
+- 單側肺野透光度明顯增加
+
+---
+
+### 情境十九：目前使用的抗生素
+
+**目標**：列出病人目前開立中的抗生素，包含藥名、劑量、給藥頻次。
+
+**步驟**：
+
+```javascript
+const drugs = await fetch('https://hapi.csh.org.tw/patient_drugs?visitNo=XXXXXXXX',
+  {credentials:'include'}).then(r=>r.json());
+
+// 抗生素關鍵字（可擴充）
+const abxKeywords = [
+  'vancomycin','meropenem','imipenem','ertapenem',
+  'piperacillin','tazobactam','cefazolin','ceftriaxone','cefepime',
+  'levofloxacin','ciprofloxacin','azithromycin','clindamycin',
+  'metronidazole','fluconazole','micafungin','amphotericin',
+  'colistin','tigecycline','linezolid','daptomycin','rifampin',
+  'trimethoprim','sulfamethoxazole','TMP','SMX'
+];
+
+const abx = drugs.filter(d =>
+  abxKeywords.some(k => (d.DrugName||d.OrderName||'').toLowerCase().includes(k.toLowerCase()))
+);
+JSON.stringify(abx.map(d=>({
+  drug: d.DrugName || d.OrderName,
+  dose: d.Dose,
+  route: d.Route,
+  freq: d.Frequency,
+  startDate: d.StartDate
+})));
+```
+
+> ⚠️ **待確認**：`patient_drugs` 的欄位名稱（`DrugName`？`OrderName`？`Dose`？）需回醫院實際查看確認。
+
+**呈現格式**：
+```
+MI06 目前抗生素（2026-05-14）
+
+  Vancomycin 1g IV Q12H（自 2026-05-10）
+  Meropenem 1g IV Q8H（自 2026-05-12）
+  Fluconazole 400mg IV QD（自 2026-05-13）
+```
+
+---
+
+### 情境二十：目前營養狀況
+
+**目標**：整合多個資料來源，評估病人的營養狀態（體重、白蛋白、灌食/TPN 情況）。
+
+**步驟**：
+
+1. **體重 / BMI**（`patient_body_record`）：
+   ```javascript
+   const body = await fetch('https://hapi.csh.org.tw/patient_body_record?visitNo=XXXXXXXX',
+     {credentials:'include'}).then(r=>r.json());
+   // 關注：Weight、Height、BMI 及測量日期
+   JSON.stringify(body.slice(-3));
+   ```
+
+2. **營養相關檢驗**（`query_cumulative_lab_data`）— 篩 Albumin、Prealbumin、Total Protein：
+   ```javascript
+   (() => {
+     const nutriItems = ['Albumin','Prealbumin','TP','Total Protein','Transferrin'];
+     const nutri = window._lab
+       .filter(d => d.TranCode==='9' &&
+         nutriItems.some(k => d.ShortName?.toLowerCase().includes(k.toLowerCase())));
+     const dates = [...new Set(nutri.map(d=>(d.LabDate||'').slice(0,10)))]
+       .filter(Boolean).sort().reverse().slice(0,3);
+     return nutri.filter(d => dates.some(dt => (d.LabDate||'').startsWith(dt)))
+       .map(d=>`${d.LabDate.slice(0,10)} ${d.ShortName}: ${d.ReportValue} ${d.Unit}${d.IsAbnormal?' ⚠':''}`);
+   })()
+   ```
+
+3. **灌食/TPN 速率**（護理班務記錄自由文字）：
+   ```javascript
+   // 篩今日班務記錄，搜尋灌食相關關鍵字
+   (() => {
+     const today = '2026-05-14';
+     const feedKeywords = ['灌食','tube feed','NG','TPN','TNA','lipid','胺基酸','營養'];
+     return window._nursing
+       .filter(r => r.RecordTime.startsWith(today) && r.RecordTypeName?.includes('班務'))
+       .filter(r => feedKeywords.some(k => r.Content?.toLowerCase().includes(k.toLowerCase())))
+       .map(r => `[${r.RecordTime.slice(11,16)}] ${r.Content}`);
+   })()
+   ```
+
+4. **營養相關醫囑/處置**（`patient_treatments`）— 篩 TPN/灌食相關：
+   ```javascript
+   const tx = await fetch('https://hapi.csh.org.tw/patient_treatments?visitNo=XXXXXXXX',
+     {credentials:'include'}).then(r=>r.json());
+   tx.filter(t => /TPN|TNA|灌食|營養|tube|feed/i.test(t.ItemName||''));
+   ```
+
+**呈現格式**：
+```
+MI07 營養狀況（2026-05-14）
+
+體位：體重 65 kg，BMI 23.5（2026-05-10 測量）
+
+營養指標：
+  Albumin:    2.8 g/dL [3.5–5.0] ⚠（2026-05-13）
+  Prealbumin: 12 mg/dL [16–35]  ⚠（2026-05-13）
+
+營養支持方式：
+  TPN（TNA）：護理記錄顯示 50 ml/hr 持續輸注
+  腸道灌食：NG tube，目標量 1500 kcal/day，目前耐受良好
+
+評估：低白蛋白血症，TPN 中，建議確認熱量目標是否達成。
+```
+
+---
+
 ## Token 過期處理
 
 症狀：查詢回傳 `"無法載入 XX 病房名單"`

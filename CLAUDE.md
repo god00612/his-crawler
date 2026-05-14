@@ -176,6 +176,25 @@ Direct fetch works: `get_inPatient?ward=MI` returns all patients with `VisitNo`/
 - `57031` 濕化高流量氧氣治療 Daily care (HFNC, day 2+)
 - `47041` Suction　`47090` VEST/HFCWO　`ZD52` ETT care
 - `42011` 物理治療:中度治療-複雜　`PTM5` Passive ROM　`PTM6` Stretching
+- `57031` = HFCWO（高頻胸壁震盪/拍痰背心）; `47041` = suction; `47090` = chest physio/VEST
+
+**get_crossTeamCare_records** (confirmed):
+- URL: `get_crossTeamCare_records?visitNo=XXXXXXXX`
+- Contains 9 team types (ShiftTypeName): 護理師/醫師/營養師/藥師/呼吸治療/社工/出院準備/安寧療護/物理治療
+- SBAR format; filter by ShiftTypeName to get specific team records
+
+**get_nursing_tube_usage** (confirmed):
+- URL: `get_nursing_tube_usage?chartno=XXXXXX` (requires ChartNo, NOT visitNo)
+- Fields: `TubeInsertion`(datetime), `TubeLength`(cm), `BodyPart`(e.g. 口腔右), `ProductNumValue`(Fr/size), `durationByDay`
+- Superior to parsing nursing free-text for structured ETT data
+
+**get_op_schedule** (confirmed):
+- URL: `get_op_schedule?chartno=XXXXXX` (requires ChartNo, NOT visitNo)
+- Returns surgery history
+
+**get_bed_records** (confirmed):
+- URL: `get_bed_records?chartno=XXXXXX` (or `?visitNo=`)
+- Returns bed history; current bed = record where `DischargeTime===''`, sorted by `StartTime` desc
 
 **Selecting a patient fires all 22 APIs at once**: Use `form_input` to select a patient's `visitNo` in the patient dropdown — HIS immediately fires all background API calls. Capture all URLs via `read_network_requests` and fetch whichever ones are needed. This replaces the Playwright 15-second wait loop entirely. The 22 APIs include: `patient_info`, `visit_history`, `get_io`, `get_pump_records`, `get_personal_note`, `patient_treatments`, `get_vital_sign`, `patient_body_record`, `get_pre_admin_orders`, `get_pharmacyReview_record`, `patient_orders`, `get_medSummary`, `get_nursing_records`, `patient_problems`, `med_allergy`, `allergy_cloud_query`, `patient_drugs`, `query_cumulative_lab_data`.
 

@@ -83,6 +83,10 @@ data = json.loads(result.stdout.decode('utf-8'))
 | 用藥清單 | `patient_drugs?visitNo=` | |
 | IO 出入量 | `get_io?visitNo=&detail=Y` | 需加 `detail=Y`，MainEventType: INPUT/OUTPUT |
 | 影像/放射報告 | `patient_orders?chartno=` | 需 ChartNo（非 visitNo），含 ReportText |
+| 跨團隊紀錄 | `get_crossTeamCare_records?visitNo=` | 社工/呼吸治療/PT/營養師/出院準備/安寧療護 SBAR，用 ShiftTypeName 篩 |
+| 管路資料（ETT） | `get_nursing_tube_usage?chartno=` | 需 ChartNo，欄位：TubeInsertion/TubeLength/ProductNumValue/durationByDay |
+| 手術紀錄 | `get_op_schedule?chartno=` | 需 ChartNo |
+| 病人位置/床位 | `get_bed_records?chartno=` | 需 ChartNo，DischargeTime==='' 為目前床位 |
 | 病房名單 | `get_inPatient?ward=MI`（直接 fetch） | 回傳 VisitNo/RoomBed/PtName |
 
 ### 累積檢驗欄位結構
@@ -294,7 +298,7 @@ data = json.loads(result.stdout.decode('utf-8'))
 [Summary 內容]
 ```
 
-> ⚠️ **待確認**：`get_medSummary` 是交班紀錄，不一定等於完整治療計劃。回醫院後確認是否有更接近 progress note 的 API。
+> `get_medSummary` 是醫師交班紀錄（含治療計劃），適合了解醫師決策方向。若需更完整的跨團隊紀錄，可補查 `get_nursing_records?visitNo=`（護理師角度）或 `get_crossTeamCare_records?visitNo=`（呼吸治療/社工/物理治療/營養師 SBAR）。
 
 ---
 
@@ -478,15 +482,34 @@ JSON.stringify({
    });
    ```
 
-3. 手術相關資料 — 查 `patient_treatments`，篩手術/OR 相關項目：
+3. 手術紀錄 — `get_op_schedule?chartno=`（已確認）：
    ```javascript
-   const tx = await fetch('https://hapi.csh.org.tw/patient_treatments?visitNo=XXXXXXXX',
+   const info = await fetch('https://hapi.csh.org.tw/patient_info?visitNo=XXXXXXXX',
      {credentials:'include'}).then(r=>r.json());
-   // 篩手術相關費用項目（關鍵字：手術、OR、麻醉、刀）
-   tx.filter(t => /手術|OR|麻醉|刀|開刀/.test(t.ItemName||''));
+   const chartno = info[0].ChartNo;
+
+   const ops = await fetch(`https://hapi.csh.org.tw/get_op_schedule?chartno=${chartno}`,
+     {credentials:'include'}).then(r=>r.json());
+   // 篩本次住院（用 VisitNo 過濾），或用 OperDate 篩近期
+   const thisVisitOps = ops.filter(o => o.VisitNo === XXXXXXXX || !o.VisitNo);
+   JSON.stringify(thisVisitOps.map(o=>({
+     date: o.OperDate, name: o.OrderName,
+     status: o.OperStatus, code: o.OperCode2,
+     anesthesia: o.AnestheticName, room: o.OperRoom
+   })));
    ```
 
-> ⚠️ **待確認**：正式手術紀錄（術式、術者、麻醉方式）可能在獨立的手術系統，不在上述 API 中。回醫院後確認：選病人後 network log 是否有手術相關 API（如 `get_operation`、`or_record` 等）。
+**get_op_schedule 欄位**：
+
+| 欄位 | 說明 |
+|---|---|
+| `OperDate` | 手術日期 |
+| `OrderName` | 術者（主刀醫師姓名） |
+| `OperStatus` | 手術狀態（如「離開手術室」） |
+| `OperCode2` | 手術代碼（NHI code） |
+| `AnestheticName` | 麻醉方式（GA / local 等） |
+| `OperRoom` | 手術室編號 |
+| `VisitNo` | 就醫編號（0 表示門診排程） |
 
 **呈現格式**：
 ```
@@ -500,7 +523,7 @@ JSON.stringify({
   [2026-05-14 08:00] 血壓穩定，升壓劑逐漸減量...
 
 手術紀錄：
-  [2026-05-12] 氣管切開術（tracheostomy）
+  [2026-05-12] 氣管切開術（OperCode2: 33127）術者：曾OO  麻醉：GA
 ```
 
 ---
@@ -565,15 +588,31 @@ MI03 大夜班（2026-05-13 23:00 ~ 2026-05-14 07:00）
 
 **目標**：已知病歷號，不知道病人目前在哪個病房/單位。
 
-> ⚠️ **待確認**：目前不知道是否有 `search_patient?chartno=` 類型的 API。
+**已確認**：`get_bed_records?chartno=` 直接可用，回傳床位異動歷史。
 
-**待確認事項**（回醫院後）：
-- 在 HIS 搜尋框輸入病歷號時，瀏覽器發出哪個 API？
-- 回傳內容是否包含目前所在病房（Ward、RoomBed）？
-- 是否可以用 `chartno` 直接取得目前的 `visitNo`？
+```javascript
+const chartno = 417086;  // 已知病歷號
+const beds = await fetch(`https://hapi.csh.org.tw/get_bed_records?chartno=${chartno}`,
+  {credentials:'include'}).then(r=>r.json());
 
-**暫用方法**：
-- 如果知道病人大約在哪個病房，用該病房名單（`get_inPatient`）掃描 `ChartNo` 欄位比對
+// 目前所在床位 = DischargeTime 為空且最新 StartTime
+const current = beds
+  .filter(b => !b.DischargeTime || b.DischargeTime === '')
+  .sort((a,b) => b.StartTime.localeCompare(a.StartTime))[0];
+
+JSON.stringify({
+  ward: current?.Ward,
+  bed: current?.RoomBed,
+  visitNo: current?.VisitNo,
+  admitDate: current?.AdmitTime?.slice(0,10),
+  doctor: current?.DrNoName,
+  dept: current?.DivName
+});
+```
+
+**get_bed_records 欄位**：Ward（病房）、RoomBed（床位）、VisitNo、AdmitTime、DischargeTime、DivName（科別）、DrNoName（主治醫師）
+
+> `?visitNo=` 也支援，可用來查某次住院的床位轉換歷史（曾從哪個床轉到哪個床）。
 
 ---
 
@@ -1004,7 +1043,20 @@ MI05 李OO [2026-05-12]：
 const drugs = await fetch('https://hapi.csh.org.tw/patient_drugs?visitNo=XXXXXXXX',
   {credentials:'include'}).then(r=>r.json());
 
-// 抗生素關鍵字（可擴充）
+// patient_drugs 需要 chartno（非 visitNo），同時涵蓋所有住院紀錄
+// 需先從 patient_info 取得 chartno
+const info = await fetch('https://hapi.csh.org.tw/patient_info?visitNo=XXXXXXXX',
+  {credentials:'include'}).then(r=>r.json());
+const chartno = info[0].ChartNo;
+const visitNo = XXXXXXXX;
+
+const drugs = await fetch(`https://hapi.csh.org.tw/patient_drugs?chartno=${chartno}`,
+  {credentials:'include'}).then(r=>r.json());
+
+// 篩本次住院 + 使用中
+const thisVisit = drugs.filter(d => d.VisitNo === visitNo && d.TreatStatus === '使用中');
+
+// 抗生素關鍵字
 const abxKeywords = [
   'vancomycin','meropenem','imipenem','ertapenem',
   'piperacillin','tazobactam','cefazolin','ceftriaxone','cefepime',
@@ -1014,19 +1066,33 @@ const abxKeywords = [
   'trimethoprim','sulfamethoxazole','TMP','SMX'
 ];
 
-const abx = drugs.filter(d =>
-  abxKeywords.some(k => (d.DrugName||d.OrderName||'').toLowerCase().includes(k.toLowerCase()))
+const abx = thisVisit.filter(d =>
+  abxKeywords.some(k => (d.ItemName||'').toLowerCase().includes(k.toLowerCase()))
 );
 JSON.stringify(abx.map(d=>({
-  drug: d.DrugName || d.OrderName,
-  dose: d.Dose,
-  route: d.Route,
-  freq: d.Frequency,
-  startDate: d.StartDate
+  drug: d.ItemName,
+  dose: `${d.Dose} ${d.DoseUnit}`,
+  route: d.way,
+  freq: d.Usage,
+  start: d['開始時間']?.slice(0,10),
+  highAlert: d.HighAlert
 })));
 ```
 
-> ⚠️ **待確認**：`patient_drugs` 的欄位名稱（`DrugName`？`OrderName`？`Dose`？）需回醫院實際查看確認。
+**patient_drugs 欄位**（已確認）：
+
+| 欄位 | 說明 |
+|---|---|
+| `ItemName` | 藥物名稱 |
+| `Dose` / `DoseUnit` | 劑量 / 單位 |
+| `Usage` | 頻次（Q8H / QD / PRN 等） |
+| `way` | 給藥途徑（IV / PO 等） |
+| `TreatStatus` | 使用中 / 停用 |
+| `開始時間` / `停用時間` | 開始 / 停止時間 |
+| `VisitNo` | 就醫編號（需過濾本次住院） |
+| `GenericName` | 學名 |
+| `HighAlert` | 高警訊藥物標記 |
+| `CtrlDrug` | 管制藥品標記 |
 
 **呈現格式**：
 ```
@@ -1239,38 +1305,42 @@ studies.filter(s =>
 **組合查詢**：
 
 ```javascript
-// 1. 基本資料 + 入院/插管日期
+// 1. 基本資料（取 ChartNo）
 const info = await fetch(`https://hapi.csh.org.tw/patient_info?visitNo=XXXXXXXX`,
   {credentials:'include'}).then(r=>r.json());
+const chartno = info[0].ChartNo;
 
-// 2. 今早 ABG（lab，篩今日）
+// 2. ETT 管路資料（get_nursing_tube_usage — 結構化，優於解析護理自由文字）
+const tube = await fetch(`https://hapi.csh.org.tw/get_nursing_tube_usage?chartno=${chartno}`,
+  {credentials:'include'}).then(r=>r.json());
+// 取最近一筆氣管內管紀錄
+const ett = tube.filter(t => /ETT|氣管內管|endotracheal/i.test(t.TubeName||t.BodyPart||''))
+  .sort((a,b)=>b.TubeInsertion.localeCompare(a.TubeInsertion))[0];
+// 欄位：TubeInsertion（插管時間 YYYY-MM-DD HH:mm）, TubeLength（深度 cm）
+//        BodyPart（位置，如 口腔右）, ProductNumValue（管徑 Fr）, durationByDay（插管天數）
+
+// 3. 今早 ABG（lab，篩今日）
 const abg = window._lab.filter(d =>
   d.TranCode==='9' && (d.LabDate||'').startsWith('2026-05-14') &&
   ['pH','pCO2','pO2','HCO3','BE','FiO2','SaO2'].some(k=>d.ShortName?.includes(k))
 );
 
-// 3. 最近痰培養
+// 4. 最近痰培養
 const sputum = window._lab.filter(d =>
   d.TranCode==='8' && /SPT|痰|sputum/i.test(d.SpecimenCode||d.Item||'')
 ).sort((a,b)=>b.LabDate.localeCompare(a.LabDate)).slice(0,2);
 
-// 4. 最新 VITALSIGN 呼吸器設定
+// 5. 最新 VITALSIGN 呼吸器設定（每小時更新）
 const latestVent = window._nursing
   .filter(r => r.RecordType === 'VITALSIGN' && (r.Content||'').includes('呼吸器：'))
   .sort((a,b)=>b.RecordTime.localeCompare(a.RecordTime))[0];
-
-// 5. 插管日期（TUBE 型別，置入氣管內管）
-const intubRecord = window._nursing
-  .filter(r => r.RecordType === 'TUBE' && /置入.*氣管內管/.test(r.Content||''))
-  .sort((a,b)=>a.RecordTime.localeCompare(b.RecordTime))[0];
-const intubDate = intubRecord?.RecordTime?.slice(0,10);
 ```
 
 **呈現格式**：
 ```
 ═══ RT 交班卡 MI01 王OO ═══
-插管天數：第 5 天（插管日 2026-05-09）       ← TUBE 型別 RecordTime
-管路深度：ETT 22 cm                         ← TUBE 型別 Content 解析
+插管天數：第 5 天（插管日 2026-05-09 21:00）  ← get_nursing_tube_usage TubeInsertion
+管路深度：ETT 22 cm（口腔右，7.0 Fr）         ← TubeLength / BodyPart / ProductNumValue
 ─────────────────────────────
 呼吸器設定（最新 VITALSIGN，每小時更新）：
   Mode: PACV, FiO2: 35%, PEEP: 8, RR: 14, 壓力: 22 cmH2O
@@ -1283,7 +1353,7 @@ const intubDate = intubRecord?.RecordTime?.slice(0,10);
   Klebsiella pneumoniae ⚠ → 藥敏見完整報告
 ```
 
-> 插管日期：`RecordType==='TUBE'` + `Content` 含 `置入.*氣管內管` → `RecordTime` 即插管時間。
+> ETT 資料優先用 `get_nursing_tube_usage?chartno=`（結構化欄位：`TubeInsertion`/`TubeLength`/`ProductNumValue`/`durationByDay`）。備用方案：`RecordType==='TUBE'` + `Content` 含 `置入.*氣管內管`。
 > 呼吸器設定：`RecordType==='VITALSIGN'` + `Content` 含 `呼吸器：` → 解析 `氧氣濃度`/`吐氣末陽壓`/`Mode:`。
 
 ---
@@ -1368,8 +1438,20 @@ const fio2Records = window._nursing
 
 2. **計算每日 P/F ratio**（PaO2 / FiO2）並用 matplotlib 繪圖（參考情境十六）。
 
-3. **I/O**：
-> ⚠️ `get_io` API 格式待確認（見情境七）。
+3. **I/O**（`get_io?visitNo=&detail=Y`）：
+```javascript
+// 需加 detail=Y，欄位：IO_DT(YYYYMMDD), MainEventType(INPUT/OUTPUT), Shift, OccurDate, EventType, Value1, Unit1
+const io = await fetch(`https://hapi.csh.org.tw/get_io?visitNo=XXXXXXXX&detail=Y`,
+  {credentials:'include'}).then(r=>r.json());
+// 每日出入量
+const daily = {};
+io.forEach(r => {
+  const d = r.IO_DT;
+  if (!daily[d]) daily[d] = {in:0, out:0};
+  if (r.MainEventType==='INPUT') daily[d].in += (r.Value1||0);
+  else if (r.MainEventType==='OUTPUT') daily[d].out += (r.Value1||0);
+});
+```
 
 **呈現格式**：趨勢折線圖（P/F ratio + PEEP 雙軸），用 `Read` tool 顯示 PNG。
 
@@ -1383,7 +1465,7 @@ const fio2Records = window._nursing
 
 1. **取最近兩張 CXR 影像**（同情境一）→ PowerShell WADO → `Read` tool 並排呈現
 2. **Claude 視覺判讀**：浸潤增加/減少、ETT tip 位置（距隆突距離）、有無新發現
-3. **放射科文字報告**：⚠️ API 待確認（同情境六）
+3. **放射科文字報告**（`patient_orders?chartno=`，篩 CXR 類別，取 `ReportText` 欄位）：
 4. **同日抽痰紀錄**（護理記錄）：
 ```javascript
 window._nursing
@@ -1486,7 +1568,6 @@ const events = window._nursing
 - 呼吸器警報 → 護理紀錄關鍵字：PIP、高壓、alarm、警報
 - 生命徵象變化 → `get_vital_sign`（若 API 支援時間篩選）
 
-> ⚠️ PIP 警報紀錄若未在護理記錄中，需確認是否有獨立的 alarm log API。
 
 **呈現格式**：
 ```
@@ -1537,15 +1618,22 @@ MI03 SpO2 驟降事件時間軸（10:00 前後 30 分鐘）
 })();
 ```
 
-2. **家屬/氣切討論紀錄**（醫師交班中找關鍵字）：
+2. **家屬/氣切討論紀錄**（醫師交班 + 社工 SBAR 紀錄）：
 ```javascript
+// 醫師交班（氣切/家屬關鍵字）
 const summary = await fetch(`https://hapi.csh.org.tw/get_medSummary?visitNo=XXXXXXXX`,
   {credentials:'include'}).then(r=>r.json());
 summary.filter(s => /氣切|tracheostomy|家屬|consent|DNR|RCW/i.test(s.Summary||''))
   .map(s=>`[${s.RecordTime}] ${s.Summary}`);
-```
 
-> ⚠️ 社工/家屬會談的正式紀錄若在獨立系統，API 尚未確認。
+// 社工/跨團隊 SBAR（get_crossTeamCare_records）
+const crossCare = await fetch(`https://hapi.csh.org.tw/get_crossTeamCare_records?visitNo=XXXXXXXX`,
+  {credentials:'include'}).then(r=>r.json());
+// ShiftTypeName 可能的值：護理師/醫師/營養師/藥師/呼吸治療/社工/出院準備/安寧療護/物理治療
+crossCare.filter(r => /社工|出院準備|安寧療護/i.test(r.ShiftTypeName||''))
+  .sort((a,b)=>b.RecordTime.localeCompare(a.RecordTime)).slice(0,5)
+  .map(r=>`[${r.RecordTime}] ${r.ShiftTypeName}：${r.Content||r.Summary||''}`);
+```
 
 **呈現格式**：
 ```
@@ -1618,7 +1706,7 @@ summary.filter(s => /氣切|tracheostomy|家屬|consent|DNR|RCW/i.test(s.Summary
 })();
 ```
 
-> ⚠️ 需確認護理紀錄中耗材更換的實際關鍵字寫法。
+> 耗材更換關鍵字需依實際護理紀錄自由文字確認；Circuit/HME 確切關鍵字可能因護士書寫習慣不同。也可考慮用 `get_nursing_tube_usage?chartno=` 查 DressingDate 欄位（敷料更換日期），但耗材更換（Circuit）未必在此 API 中。
 
 **呈現格式**：
 ```
@@ -1657,11 +1745,13 @@ summary.filter(s => /氣切|tracheostomy|家屬|consent|DNR|RCW/i.test(s.Summary
         {credentials:'include'}).then(r=>r.json())
     ]);
 
-    // 條件一：FiO2/PEEP 上升（比較今日與昨日班務記錄）
+    // 條件一：FiO2/PEEP 上升（比較今日與昨日 VITALSIGN 記錄）
     const getVentVal = (notes, date, key) => {
-      const note = notes.filter(r=>r.RecordTime.startsWith(date)&&r.RecordTypeName?.includes('班務'))
+      const keyMap = {FiO2:'氧氣濃度', PEEP:'吐氣末陽壓'};
+      const note = notes
+        .filter(r=>r.RecordTime.startsWith(date)&&r.RecordType==='VITALSIGN'&&(r.Content||'').includes('呼吸器：'))
         .sort((a,b)=>b.RecordTime.localeCompare(a.RecordTime))[0];
-      const m = note?.Content?.match(new RegExp(key+'[:\\s]*(\\d+)','i'));
+      const m = note?.Content?.match(new RegExp((keyMap[key]||key)+':(\\d+)'));
       return m ? parseInt(m[1]) : null;
     };
     const fio2Today = getVentVal(nursing, today, 'FiO2');
@@ -1698,31 +1788,32 @@ summary.filter(s => /氣切|tracheostomy|家屬|consent|DNR|RCW/i.test(s.Summary
 })();
 ```
 
-> ⚠️ FiO2/PEEP 解析格式待確認（見 RT-1）。
 
 ---
 
-### RT-12：困難脫離病患 — I/O + CVP + RSBI 趨勢
+### RT-12：困難脫離病患 — I/O + CVP 趨勢
 
-**目標**：近三天累計 I/O 平衡、CVP 走勢，對照每日 SBT 的 RSBI 變化。
+**目標**：近三天累計 I/O 平衡、CVP 走勢。
 
 **資料來源**：
 
 | 資料 | 來源 | 狀態 |
 |---|---|---|
-| 累計 I/O | `get_io?visitNo=` | ⚠️ API 格式待確認 |
+| 累計 I/O | `get_io?visitNo=&detail=Y` | ✓ 已確認（見情境七） |
 | CVP | 護理**班務記錄**自由文字 | ✓ 有記錄（解析關鍵字 CVP） |
-| RSBI (f/Vt) | 護理紀錄自由文字 | 需確認是否有記錄 |
 
-**RSBI 從護理紀錄解析**（format 待確認）：
+**I/O 近三天資料**：
 ```javascript
-window._nursing
-  .filter(r => /RSBI|f\/Vt|淺快呼吸/i.test(r.Content||''))
-  .sort((a,b)=>a.RecordTime.localeCompare(b.RecordTime))
-  .map(r => {
-    const m = r.Content.match(/RSBI[:\s]*(\d+)/i);
-    return {date: r.RecordTime.slice(0,10), rsbi: m?parseInt(m[1]):null, note: r.Content};
-  });
+const io = await fetch('https://hapi.csh.org.tw/get_io?visitNo=XXXXXXXX&detail=Y',
+  {credentials:'include'}).then(r=>r.json());
+// 每日小計
+const days = ['20260512','20260513','20260514'];
+days.forEach(dt => {
+  const dayIO = io.filter(r=>r.IO_DT===dt);
+  const in_  = dayIO.filter(r=>r.MainEventType==='INPUT').reduce((s,r)=>s+(r.Value1||0),0);
+  const out_ = dayIO.filter(r=>r.MainEventType==='OUTPUT').reduce((s,r)=>s+(r.Value1||0),0);
+  console.log(`${dt}: IN=${in_} OUT=${out_} BAL=${in_-out_}`);
+});
 ```
 
 **CVP 從護理班務記錄解析**：
@@ -1741,14 +1832,11 @@ window._nursing
 **趨勢圖（matplotlib）**：
 ```python
 # 三天資料繪製：
-# 上圖：每日 I/O 平衡（I/O API 確認後補值）
-# 中圖：CVP 走勢（從護理記錄解析）
-# 下圖：RSBI（<105 = 可能可脫離）
+# 上圖：每日 I/O 平衡
+# 下圖：CVP 走勢
 import matplotlib.pyplot as plt
 # ... 同情境十六的繪圖模式
 ```
-
-> ⚠️ I/O 部分仍待 `get_io` API 確認；CVP 和 RSBI 從護理紀錄解析已可行。
 
 ---
 
@@ -1831,14 +1919,13 @@ MI03 張OO：
 
 **步驟**：
 
-**1. 找 HFCWO 醫囑**（patient_treatments 或 patient_orders）：
+**1. 找 HFCWO 醫囑**（patient_treatments，ItemCode 57031）：
 ```javascript
 const tx = await fetch(`https://hapi.csh.org.tw/patient_treatments?visitNo=XXXXXXXX`,
   {credentials:'include'}).then(r=>r.json());
-tx.filter(t => /HFCWO|拍痰背心|高頻|chest.*oscill|vest/i.test(t.ItemName||''));
+// HFCWO 代碼：57031（高頻胸壁震盪）
+tx.filter(t => t.ItemCode==='57031' || /HFCWO|拍痰背心|高頻|chest.*oscill|vest/i.test(t.ItemName||''));
 ```
-
-> ⚠️ HFCWO 的醫囑代碼和所在 API（treatments 或 orders）待回醫院確認。
 
 **2. 從護理紀錄分析痰量與黏稠度**：
 ```javascript
@@ -1851,12 +1938,13 @@ window._nursing
   .map(r=>`[${r.RecordTime.slice(0,16)}] ${r.Content}`);
 ```
 
-**3. PT 排程**（patient_orders 或 patient_treatments 找物理治療相關）：
+**3. PT 排程**（patient_treatments，ItemCode 47041/47090 等物理治療代碼）：
 ```javascript
-tx.filter(t => /物理治療|PT|胸腔|chest.*physio|呼吸治療/i.test(t.ItemName||''));
+// PT 代碼：47041（胸腔物理治療）, 47090（物理治療其他）
+tx.filter(t => ['47041','47090'].includes(t.ItemCode) ||
+  /物理治療|PT|胸腔|chest.*physio/i.test(t.ItemName||''));
+// 頻次在 t.Freq 或 t.FreqName 欄位（可能為「每日一次」/「BID」等）
 ```
-
-> ⚠️ PT 排程的 API 和頻次欄位待確認。
 
 ---
 
@@ -1914,16 +2002,18 @@ SBT 期間心肺交互監測（09:00–10:00）
 
 **步驟**：
 
-**1. 從護理紀錄取目前呼吸器設定（Ve、FiO2）**：
+**1. 從 VITALSIGN 紀錄取目前呼吸器設定（Ve、FiO2）**：
 ```javascript
-const latestNote = window._nursing
-  .filter(r=>r.RecordTypeName?.includes('班務'))
+// VITALSIGN 每小時記錄（比班務記錄更即時）
+const latestVent = window._nursing
+  .filter(r => r.RecordType === 'VITALSIGN' && (r.Content||'').includes('呼吸器：'))
   .sort((a,b)=>b.RecordTime.localeCompare(a.RecordTime))[0];
-// 解析：Ve（分鐘通氣量）、FiO2
-const veMatch  = latestNote?.Content?.match(/Ve[:\s]*([\d.]+)/i);
-const fio2Match = latestNote?.Content?.match(/FiO2[:\s]*(\d+)/i);
-const ve   = veMatch  ? parseFloat(veMatch[1])  : null;  // L/min
-const fio2 = fio2Match? parseInt(fio2Match[1])/100 : null;
+const content = latestVent?.Content || '';
+// 解析：Ve（分鐘通氣量）、FiO2（氧氣濃度）
+const veMatch   = content.match(/Ve[:\s]*([\d.]+)/i);
+const fio2Match = content.match(/氧氣濃度:(\d+)/);
+const ve   = veMatch   ? parseFloat(veMatch[1])   : null;  // L/min
+const fio2 = fio2Match ? parseInt(fio2Match[1])/100 : null;
 ```
 
 **2. 氧氣消耗試算（Python）**：
@@ -1952,11 +2042,15 @@ for name, vol in cylinders.items():
 
 **3. 確認鎮靜加強醫囑**：
 ```javascript
-// patient_drugs 篩鎮靜相關 STAT 或 PRN 醫囑
-const drugs = await fetch(`https://hapi.csh.org.tw/patient_drugs?visitNo=XXXXXXXX`,
+// patient_drugs 需要 chartno（見情境十九）
+const info = await fetch('https://hapi.csh.org.tw/patient_info?visitNo=XXXXXXXX',
   {credentials:'include'}).then(r=>r.json());
-drugs.filter(d => /fentanyl|midazolam|propofol|ketamine|versed|dormicum/i
-  .test(d.DrugName||d.OrderName||''));
+const drugs = await fetch(`https://hapi.csh.org.tw/patient_drugs?chartno=${info[0].ChartNo}`,
+  {credentials:'include'}).then(r=>r.json());
+// 篩本次住院 + 鎮靜藥
+drugs.filter(d => d.VisitNo===XXXXXXXX &&
+  /fentanyl|midazolam|propofol|ketamine|versed|dormicum/i.test(d.ItemName||''))
+  .map(d=>({name:d.ItemName, dose:`${d.Dose}${d.DoseUnit}`, freq:d.Usage, status:d.TreatStatus}));
 ```
 
 **呈現格式**：

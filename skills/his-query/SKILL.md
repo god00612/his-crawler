@@ -1013,6 +1013,512 @@ MI07 營養狀況（2026-05-14）
 
 ---
 
+## 呼吸治療師（RT）專用情境
+
+> **共同前提**：呼吸器設定（Mode、FiO2、PEEP、Tidal Volume、Rate、PIP）存在護理**班務記錄**自由文字中，格式因院區而異。以下 SOP 中凡涉及呼吸器設定解析，均需回醫院確認實際記錄格式後調整關鍵字。
+
+---
+
+### RT-1：全區危險訊號掃描（晨間快篩）
+
+**目標**：找出今早有抽 ABG 且 PaCO2 > 50 或 SpO2 < 90% 的病人，附呼吸器 Mode 與 FiO2。
+
+**步驟**：
+
+**Phase 1 — 全病房並行掃描 ABG**：
+```javascript
+(async () => {
+  const patients = [ /* 病房名單 + visitNo */ ];
+  const today = '2026-05-14';
+  const abgItems = ['PaCO2','pCO2','SpO2','SaO2','PaO2','pH'];
+
+  const results = await Promise.all(patients.map(async pt => {
+    window[`_lab_${pt.bed}`] = null;
+    fetch(`https://hapi.csh.org.tw/query_cumulative_lab_data?visitNo=${pt.visitNo}`,
+      {credentials:'include'}).then(r=>r.json()).then(d=>{window[`_lab_${pt.bed}`]=d;});
+    return pt.bed;
+  }));
+  return '已發射 ' + results.length + ' 個 fetch';
+})();
+```
+
+等待後解析：
+```javascript
+(() => {
+  const patients = [ /* 同上 */ ];
+  const today = '2026-05-14';
+  const alerts = [];
+  for (const pt of patients) {
+    const lab = window[`_lab_${pt.bed}`];
+    if (!lab) continue;
+    const todayAbg = lab.filter(d =>
+      d.TranCode==='9' && (d.LabDate||'').startsWith(today) &&
+      ['PaCO2','pCO2','SpO2','SaO2'].some(k => d.ShortName?.includes(k))
+    );
+    const paco2 = todayAbg.find(d => d.ShortName?.includes('CO2'));
+    const spo2  = todayAbg.find(d => d.ShortName?.includes('SpO2')||d.ShortName?.includes('SaO2'));
+    if ((paco2 && parseFloat(paco2.ReportValue) > 50) ||
+        (spo2  && parseFloat(spo2.ReportValue)  < 90)) {
+      alerts.push({bed: pt.bed, paco2: paco2?.ReportValue, spo2: spo2?.ReportValue});
+    }
+  }
+  return JSON.stringify(alerts);
+})();
+```
+
+**Phase 2 — 對警示床位查護理班務記錄取呼吸器設定**：
+```javascript
+// 針對 alerts 中每個床位
+window._nursing = null;
+fetch(`https://hapi.csh.org.tw/get_nursing_records?visitNo=XXXXXXXX`,
+  {credentials:'include'}).then(r=>r.json()).then(d=>{window._nursing=d;});
+// 篩今日最新班務，找 Mode/FiO2/PEEP 關鍵字
+(() => {
+  const today = '2026-05-14';
+  return window._nursing
+    .filter(r => r.RecordTime.startsWith(today) && r.RecordTypeName?.includes('班務'))
+    .sort((a,b) => b.RecordTime.localeCompare(a.RecordTime))
+    .slice(0,3)
+    .map(r => r.Content);
+})()
+```
+
+> ⚠️ 呼吸器 Mode/FiO2 關鍵字需回醫院確認班務記錄格式。
+
+---
+
+### RT-2：大夜班動態追蹤
+
+**目標**：單一病人大夜班（23:00–07:00）的完整動態——呼吸器參數變動、STAT ABG、Portable CXR、抽痰紀錄。
+
+**步驟（先廣後深）**：
+
+**第一層 — 護理紀錄 + 醫師交班**（通常已足夠）：
+```javascript
+// 大夜班時間區間
+const from = '2026-05-13T23:00';
+const to   = '2026-05-14T07:00';
+
+// 護理紀錄篩大夜
+window._nursing
+  .filter(r => r.RecordTime >= from && r.RecordTime <= to)
+  .sort((a,b) => a.RecordTime.localeCompare(b.RecordTime))
+  .map(r => `[${r.RecordTime.slice(11,16)}] ${r.RecordTypeName}: ${r.Content}`);
+```
+
+**第二層 — 確認 STAT ABG（有無夜間緊急抽血）**：
+```javascript
+(() => {
+  const from = '2026-05-13T23:00';
+  const to   = '2026-05-14T07:00';
+  const abgItems = ['pH','pCO2','pO2','HCO3','BE','SaO2','PaO2','PaCO2'];
+  return window._lab
+    .filter(d => d.TranCode==='9' &&
+      d.LabDate >= from && d.LabDate <= to &&
+      abgItems.some(k => d.ShortName?.includes(k)))
+    .map(d => `${d.LabDate.slice(11,16)} ${d.ShortName}: ${d.ReportValue} ${d.Unit}${d.IsAbnormal?' ⚠':''}`);
+})()
+```
+
+**第三層 — Portable CXR（PACS 確認）**：
+```javascript
+// get_oracle_pacs_study_list 篩昨晚日期，看有無 Portable/緊急 CXR
+studies.filter(s =>
+  s.StudyDateTime >= '2026-05-13T23:00' &&
+  s.StudyDateTime <= '2026-05-14T07:00' &&
+  /chest|cxr|胸部/i.test(s.StudyDesc)
+)
+```
+
+---
+
+### RT-3：RT 專屬交班卡
+
+**目標**：查房用一頁式摘要——插管天數、管路深度、最新呼吸器設定、今早 Gas、最近痰培養。
+
+**組合查詢**：
+
+```javascript
+// 1. 基本資料 + 入院/插管日期
+const info = await fetch(`https://hapi.csh.org.tw/patient_info?visitNo=XXXXXXXX`,
+  {credentials:'include'}).then(r=>r.json());
+
+// 2. 今早 ABG（lab，篩今日）
+const abg = window._lab.filter(d =>
+  d.TranCode==='9' && (d.LabDate||'').startsWith('2026-05-14') &&
+  ['pH','pCO2','pO2','HCO3','BE','FiO2','SaO2'].some(k=>d.ShortName?.includes(k))
+);
+
+// 3. 最近痰培養
+const sputum = window._lab.filter(d =>
+  d.TranCode==='8' && /SPT|痰|sputum/i.test(d.SpecimenCode||d.Item||'')
+).sort((a,b)=>b.LabDate.localeCompare(a.LabDate)).slice(0,2);
+
+// 4. 最新班務記錄（呼吸器設定、管路深度）
+const latestNote = window._nursing
+  .filter(r => r.RecordTypeName?.includes('班務'))
+  .sort((a,b)=>b.RecordTime.localeCompare(a.RecordTime))[0];
+```
+
+**呈現格式**：
+```
+═══ RT 交班卡 MI01 王OO ═══
+插管天數：第 5 天（插管日 2026-05-09）
+管路深度：ETT 22 cm（唇齒處）          ← 來自最新班務記錄
+─────────────────────────────
+呼吸器設定（最新班務）：
+  Mode: SIMV, FiO2: 40%, PEEP: 6, TV: 450, Rate: 12
+─────────────────────────────
+今早 ABG（08:15）：
+  pH 7.38 | pCO2 42 | pO2 88 | HCO3 24 | BE -1
+  P/F ratio: 220
+─────────────────────────────
+最近痰培養（2026-05-12）：
+  Klebsiella pneumoniae ⚠ → 藥敏見完整報告
+```
+
+> ⚠️ 插管日期需從護理紀錄找「插管」關鍵字確認（與入院日期不同）；呼吸器設定解析待確認格式。
+
+---
+
+### RT-4：脫離呼吸器候選名單（SBT 前篩選）
+
+**目標**：全病房自動篩出符合 SBT 前置條件的病人。
+
+**篩選條件**：插管 > 48 小時、FiO2 ≤ 40%、PEEP ≤ 5、無發燒、未使用升壓劑。
+
+**步驟（全病房掃描）**：
+
+```javascript
+(async () => {
+  const patients = [ /* 病房名單 */ ];
+  const today = '2026-05-14';
+
+  const results = await Promise.all(patients.map(async pt => {
+    // 取今日最新班務記錄
+    const nursing = await fetch(
+      `https://hapi.csh.org.tw/get_nursing_records?visitNo=${pt.visitNo}`,
+      {credentials:'include'}).then(r=>r.json());
+    const latestNote = nursing
+      .filter(r => r.RecordTime.startsWith(today) && r.RecordTypeName?.includes('班務'))
+      .sort((a,b)=>b.RecordTime.localeCompare(a.RecordTime))[0];
+    const content = latestNote?.Content || '';
+
+    // 解析條件（關鍵字待確認實際格式）
+    const fio2Match  = content.match(/FiO2[:\s]*(\d+)/i);
+    const peepMatch  = content.match(/PEEP[:\s]*(\d+)/i);
+    const fio2  = fio2Match  ? parseInt(fio2Match[1])  : null;
+    const peep  = peepMatch  ? parseInt(peepMatch[1])  : null;
+    const noVaso = !/norepinephrine|epinephrine|dopamine|vasopressin/i.test(content);
+
+    return {
+      bed: pt.bed, name: pt.name,
+      fio2, peep, noVaso,
+      candidate: fio2 <= 40 && peep <= 5 && noVaso
+    };
+  }));
+
+  return results.filter(r=>r.candidate)
+    .map(r=>`${r.bed} ${r.name}: FiO2=${r.fio2}% PEEP=${r.peep} 無升壓劑`);
+})();
+```
+
+> ⚠️ FiO2/PEEP 解析的正規表達式需回醫院確認班務記錄的實際寫法。插管天數計算需先確認插管日期的記錄方式。
+
+---
+
+### RT-5：P/F Ratio 趨勢圖 + PEEP/I/O 對照
+
+**目標**：過去 N 天的 P/F ratio 趨勢，對照 PEEP 調整與 I/O 平衡。
+
+**步驟**：
+
+1. **取 PaO2 + FiO2 歷史資料**（lab + 護理記錄）：
+```javascript
+// PaO2：來自 query_cumulative_lab_data TranCode:"9"
+const pao2Records = window._lab
+  .filter(d => d.TranCode==='9' && d.ShortName?.includes('PaO2'));
+
+// FiO2：來自每日班務記錄自由文字（解析 FiO2 數值）
+const fio2Records = window._nursing
+  .filter(r => r.RecordTypeName?.includes('班務'))
+  .map(r => {
+    const m = r.Content?.match(/FiO2[:\s]*(\d+)/i);
+    return m ? {date: r.RecordTime.slice(0,10), fio2: parseInt(m[1])/100} : null;
+  }).filter(Boolean);
+```
+
+2. **計算每日 P/F ratio**（PaO2 / FiO2）並用 matplotlib 繪圖（參考情境十六）。
+
+3. **I/O**：
+> ⚠️ `get_io` API 格式待確認（見情境七）。
+
+**呈現格式**：趨勢折線圖（P/F ratio + PEEP 雙軸），用 `Read` tool 顯示 PNG。
+
+---
+
+### RT-6：CXR 對比 + ETT 位置 + 抽痰狀況
+
+**目標**：比較今日與昨日 CXR（浸潤變化、ETT 位置），並對照抽痰記錄。
+
+**步驟**：
+
+1. **取最近兩張 CXR 影像**（同情境一）→ PowerShell WADO → `Read` tool 並排呈現
+2. **Claude 視覺判讀**：浸潤增加/減少、ETT tip 位置（距隆突距離）、有無新發現
+3. **放射科文字報告**：⚠️ API 待確認（同情境六）
+4. **同日抽痰紀錄**（護理記錄）：
+```javascript
+window._nursing
+  .filter(r => r.RecordTime.startsWith('2026-05-14') &&
+    /抽痰|suction|sputum|痰/i.test(r.Content||''))
+  .sort((a,b)=>a.RecordTime.localeCompare(b.RecordTime))
+  .map(r=>`[${r.RecordTime.slice(11,16)}] ${r.Content}`);
+```
+
+**呈現格式**：
+```
+【昨日 CXR 2026-05-13】     【今日 CXR 2026-05-14】
+[影像]                        [影像]
+
+影像判讀：
+  右下肺浸潤較昨日增加 ⚠
+  ETT tip 約距隆突 4 cm，位置尚可
+
+抽痰紀錄（今日）：
+  [08:00] 黃綠色濃痰，量中，較昨日增多 ⚠
+  [14:00] 白色稀痰，量少
+```
+
+---
+
+### RT-7：拔管前氣道安全確認
+
+**目標**：確認 Cuff leak test 結果、類固醇醫囑是否開立、最後給藥時間。
+
+**步驟（先廣後深）**：
+
+**第一層 — 護理紀錄找 Cuff leak**：
+```javascript
+window._nursing
+  .filter(r => /cuff|leak|漏氣/i.test(r.Content||''))
+  .sort((a,b)=>b.RecordTime.localeCompare(a.RecordTime))
+  .slice(0,3)
+  .map(r=>`[${r.RecordTime}] ${r.Content}`);
+```
+
+**第二層 — 類固醇醫囑**：
+```javascript
+const drugs = await fetch(`https://hapi.csh.org.tw/patient_drugs?visitNo=XXXXXXXX`,
+  {credentials:'include'}).then(r=>r.json());
+// 篩類固醇（Dexamethasone、Solu-Medrol、Prednisolone）
+drugs.filter(d =>
+  /dexamethasone|dexa|solu.?medrol|methylprednisolone|prednisolone/i
+  .test(d.DrugName||d.OrderName||'')
+);
+```
+
+**第三層 — 最後給藥時間**（護理紀錄找給藥記錄）：
+```javascript
+window._nursing
+  .filter(r => /dexamethasone|dexa|類固醇|steroi/i.test(r.Content||''))
+  .sort((a,b)=>b.RecordTime.localeCompare(a.RecordTime))
+  .slice(0,1);
+```
+
+**呈現格式**：
+```
+MI02 拔管前確認清單
+
+Cuff Leak Test：
+  [2026-05-14 06:00] 漏氣量 180 mL，通過標準（>110 mL）✓
+
+類固醇預防喉頭水腫：
+  Dexamethasone 5mg IV Q6H × 4 dose（已開立）✓
+  最後一劑預計：2026-05-14 18:00
+  → 建議拔管時機：最後一劑後 1–2 小時
+
+⚠️ 以上資料請再與主治醫師確認。
+```
+
+---
+
+### RT-8：血氧驟降事件根因分析
+
+**目標**：SpO2 突然下降時，從多源記錄找出時間軸與根本原因。
+
+**步驟**：
+
+指定事件時間（例如 10:00），往前後各 30 分鐘查：
+
+```javascript
+const eventTime = '2026-05-14T10:00';
+const from = '2026-05-14T09:30';
+const to   = '2026-05-14T10:30';
+
+// 護理紀錄（抽痰、翻身、給藥、緊急處置）
+const events = window._nursing
+  .filter(r => r.RecordTime >= from && r.RecordTime <= to)
+  .sort((a,b)=>a.RecordTime.localeCompare(b.RecordTime))
+  .map(r=>`[${r.RecordTime.slice(11,16)}] ${r.RecordTypeName}: ${r.Content}`);
+```
+
+**交叉比對清單**：
+- 抽痰/翻身 → 護理紀錄關鍵字：抽痰、suction、翻身、reposit
+- 鎮靜劑給予 → 護理紀錄關鍵字：fentanyl、midazolam、propofol、給藥
+- 呼吸器警報 → 護理紀錄關鍵字：PIP、高壓、alarm、警報
+- 生命徵象變化 → `get_vital_sign`（若 API 支援時間篩選）
+
+> ⚠️ PIP 警報紀錄若未在護理記錄中，需確認是否有獨立的 alarm log API。
+
+**呈現格式**：
+```
+MI03 SpO2 驟降事件時間軸（10:00 前後 30 分鐘）
+
+09:35  處置 護士A：抽痰，黃綠色濃痰大量
+09:50  班務 護士A：呼吸器 PIP 升至 38 cmH2O，通知醫師
+10:00  ⚠️ SpO2 drop 85%
+10:05  緊急 醫師B：聽診，右側呼吸音減弱，懷疑右側氣胸
+10:10  處置 護士A：備 CXR Portable
+10:20  處置 護士A：醫師執行胸腔穿刺減壓，SpO2 回升至 95%
+
+根本原因：大量濃痰導致 PIP 升高 → 張力性氣胸
+```
+
+---
+
+### RT-9：氣切時機追蹤（插管 14/21 天）
+
+**目標**：列出插管即將滿 14 或 21 天的病人，附家屬/醫師討論紀錄。
+
+**步驟**：
+
+1. **取各病人插管日期**（護理紀錄找「插管」事件）：
+```javascript
+(async () => {
+  const patients = [ /* 病房名單 */ ];
+  const today = new Date('2026-05-14');
+
+  const results = await Promise.all(patients.map(async pt => {
+    const nursing = await fetch(
+      `https://hapi.csh.org.tw/get_nursing_records?visitNo=${pt.visitNo}`,
+      {credentials:'include'}).then(r=>r.json());
+    // 找最早的插管記錄
+    const intubation = nursing
+      .filter(r => /插管|intubat|ETT|氣管內管/i.test(r.Content||''))
+      .sort((a,b)=>a.RecordTime.localeCompare(b.RecordTime))[0];
+    if (!intubation) return {...pt, days: null};
+    const intubDate = new Date(intubation.RecordTime);
+    const days = Math.floor((today - intubDate) / 86400000);
+    return {...pt, days, intubDate: intubation.RecordTime.slice(0,10)};
+  }));
+
+  return results
+    .filter(r => r.days >= 12)  // 12天以上開始追蹤
+    .sort((a,b)=>b.days-a.days)
+    .map(r=>`${r.bed} ${r.name}: 插管第 ${r.days} 天（${r.intubDate}）`);
+})();
+```
+
+2. **家屬/氣切討論紀錄**（醫師交班中找關鍵字）：
+```javascript
+const summary = await fetch(`https://hapi.csh.org.tw/get_medSummary?visitNo=XXXXXXXX`,
+  {credentials:'include'}).then(r=>r.json());
+summary.filter(s => /氣切|tracheostomy|家屬|consent|DNR|RCW/i.test(s.Summary||''))
+  .map(s=>`[${s.RecordTime}] ${s.Summary}`);
+```
+
+> ⚠️ 社工/家屬會談的正式紀錄若在獨立系統，API 尚未確認。
+
+**呈現格式**：
+```
+氣切評估追蹤（2026-05-14）
+
+⚠️ 即將滿 21 天：
+  MI03 張OO — 插管第 19 天（2026-04-25）
+    交班紀錄：「家屬已討論氣切，尚未決定」（2026-05-12）
+
+⚠️ 即將滿 14 天：
+  MI07 陳OO — 插管第 13 天（2026-05-01）
+    交班紀錄：無氣切相關紀錄，建議啟動討論
+```
+
+---
+
+### RT-10：耗材更換排程（Circuit / HME / Closed Suction）
+
+**目標**：列出今日需更換耗材的床號。
+
+**更換週期**：
+
+| 耗材 | 更換週期 |
+|---|---|
+| 呼吸器管路（Circuit） | 每 7 天 |
+| HME（人工鼻） | 每日（或依醫囑） |
+| Closed Suction | 每 7 天 |
+
+**步驟**：
+
+找各床最後一次更換記錄：
+```javascript
+(async () => {
+  const patients = [ /* 病房名單 */ ];
+  const today = '2026-05-14';
+
+  const results = await Promise.all(patients.map(async pt => {
+    const nursing = await fetch(
+      `https://hapi.csh.org.tw/get_nursing_records?visitNo=${pt.visitNo}`,
+      {credentials:'include'}).then(r=>r.json());
+
+    const findLast = (keywords) => nursing
+      .filter(r => keywords.some(k => r.Content?.toLowerCase().includes(k)))
+      .sort((a,b)=>b.RecordTime.localeCompare(a.RecordTime))[0];
+
+    const circuitLast  = findLast(['circuit','管路更換','呼吸器管路']);
+    const hmeLast      = findLast(['hme','人工鼻']);
+    const closedLast   = findLast(['closed suction','密閉式','抽痰管更換']);
+
+    const daysSince = (rec) => rec
+      ? Math.floor((new Date(today)-new Date(rec.RecordTime.slice(0,10)))/86400000)
+      : 999;
+
+    return {
+      bed: pt.bed, name: pt.name,
+      circuit:  {days: daysSince(circuitLast),  due: daysSince(circuitLast)  >= 7},
+      hme:      {days: daysSince(hmeLast),       due: daysSince(hmeLast)      >= 1},
+      closed:   {days: daysSince(closedLast),    due: daysSince(closedLast)   >= 7},
+    };
+  }));
+
+  return results.filter(r => r.circuit.due || r.hme.due || r.closed.due)
+    .map(r => {
+      const items = [];
+      if (r.circuit.due) items.push(`Circuit（第${r.circuit.days}天）`);
+      if (r.hme.due)     items.push(`HME（第${r.hme.days}天）`);
+      if (r.closed.due)  items.push(`Closed Suction（第${r.closed.days}天）`);
+      return `${r.bed} ${r.name}：${items.join('、')}`;
+    });
+})();
+```
+
+> ⚠️ 需確認護理紀錄中耗材更換的實際關鍵字寫法。
+
+**呈現格式**：
+```
+今日耗材更換清單（2026-05-14）
+
+待換 Circuit：
+  MI01 王OO（第 7 天，今日到期）
+  MI05 李OO（第 8 天，已逾期 ⚠）
+
+待換 HME：
+  MI03 張OO、MI07 陳OO、MI09 林OO
+
+待換 Closed Suction：
+  MI02 吳OO（第 7 天，今日到期）
+```
+
+---
+
 ## Token 過期處理
 
 症狀：查詢回傳 `"無法載入 XX 病房名單"`

@@ -267,6 +267,100 @@ data = json.loads(result.stdout.decode('utf-8'))
 
 ---
 
+### 情境五：生化檢驗
+
+**目標**：呈現病人最新一次（或近幾天）的生化檢驗結果，異常項目標記。
+
+**步驟**：
+
+1. 取累積檢驗，篩數值類（TranCode:"9"）：
+   ```javascript
+   window._lab = null;
+   fetch('https://hapi.csh.org.tw/query_cumulative_lab_data?visitNo=XXXXXXXX',
+     {credentials:'include'}).then(r=>r.json()).then(d=>{window._lab=d;});
+   // 等完成後解析
+   (() => {
+     const num = window._lab.filter(d => d.TranCode === '9');
+     // 生化關鍵字
+     const bioKeywords = ['ALT','AST','Bil','T-Bil','D-Bil','Cr','BUN','Na','K','Cl','Ca','Mg','P',
+       'Glucose','AC','PC','Albumin','TP','ALP','GGT','LDH','Amylase','Lipase','Uric'];
+     const bio = num.filter(d => bioKeywords.some(k => d.ShortName?.includes(k)));
+     // 取最新日期
+     const dates = [...new Set(bio.map(d=>(d.LabDate||'').slice(0,10)))].filter(Boolean).sort().reverse();
+     const latest = dates[0];
+     return bio.filter(d=>(d.LabDate||'').startsWith(latest))
+       .map(d=>`${d.ShortName}: ${d.ReportValue} ${d.Unit} [${d.RefRange||''}]${d.IsAbnormal?' ⚠':''}`)
+       .join('\n');
+   })()
+   ```
+
+2. 若需要近幾天趨勢，改取最近 N 天日期，每個項目列出多個時間點的值。
+
+**生化項目分類**：
+
+| 類別 | 項目 |
+|---|---|
+| 肝功能 | ALT、AST、T-Bil、D-Bil、ALP、GGT、Albumin、TP |
+| 腎功能 | Cr、BUN、Uric Acid |
+| 電解質 | Na、K、Cl、Ca、Mg、P |
+| 血糖 | Glucose、AC、PC、HbA1c |
+| 胰臟 | Amylase、Lipase |
+| 其他 | LDH |
+
+**呈現格式**：
+```
+生化檢驗（2026-05-14）
+
+肝功能：
+  ALT: 45 U/L [≤40] ⚠
+  AST: 38 U/L [≤40]
+  T-Bil: 1.2 mg/dL [≤1.5]
+
+腎功能：
+  Cr: 2.1 mg/dL [0.6–1.2] ⚠
+  BUN: 35 mg/dL [8–25] ⚠
+
+電解質：
+  Na: 138 mEq/L [136–145]
+  K: 3.8 mEq/L [3.5–5.0]
+```
+
+---
+
+### 情境六：檢查報告（影像文字報告）
+
+> ⚠️ **待確認**：目前 PACS 流程只能取得影像 JPEG，放射科醫師的文字報告（impression/findings）尚不知道從哪個 API 取得。
+
+**已知**：
+- `get_oracle_pacs_study_list` 回傳的 `StudyDesc` 只是檢查名稱，不含報告內容
+- WADO 只提供影像檔
+
+**待確認事項**（回醫院後）：
+- HIS 裡點開影像報告時，瀏覽器發出哪個 API request？
+- 回傳格式是什麼（純文字 / JSON / PDF）？
+- 是否用 `chartno` 或 `ACCESSION_NO` 查詢？
+
+---
+
+### 情境七：IO（輸入 / 輸出量）
+
+> ⚠️ **待確認**：`get_io` API 存在於 22 個自動觸發的 API 清單中，但尚未確認：
+> - 是否支援 `?visitNo=` 直接查詢
+> - 回傳的欄位結構為何
+> - 時間範圍怎麼篩（日期 / 班別）
+
+**暫用方法**（模式 A，選病人後攔截）：
+
+```
+1. form_input 選病人 visitNo → HIS 自動發出 get_io
+2. read_network_requests 取得 get_io 的完整 URL
+3. javascript_tool fetch 該 URL → 檢視回傳結構
+```
+
+回醫院確認後補上完整 SOP 與欄位說明。
+
+---
+
 ## Token 過期處理
 
 症狀：查詢回傳 `"無法載入 XX 病房名單"`

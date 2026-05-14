@@ -1519,6 +1519,360 @@ summary.filter(s => /氣切|tracheostomy|家屬|consent|DNR|RCW/i.test(s.Summary
 
 ---
 
+### RT-11：多條件惡化篩查（FiO2/PEEP上升 + 膿痰 + 發炎指標）
+
+**目標**：插管 > 48h 且同時符合三條件的床號——(1) 過去 24h FiO2 或 PEEP 需求上升、(2) 今日痰液轉黃綠膿痰、(3) 最新 WBC/CRP 上升。
+
+**步驟（全病房 Promise.all）**：
+
+```javascript
+(async () => {
+  const patients = [ /* 病房名單 */ ];
+  const today = '2026-05-14';
+  const yesterday = '2026-05-13';
+
+  const results = await Promise.all(patients.map(async pt => {
+    const [nursing, lab] = await Promise.all([
+      fetch(`https://hapi.csh.org.tw/get_nursing_records?visitNo=${pt.visitNo}`,
+        {credentials:'include'}).then(r=>r.json()),
+      fetch(`https://hapi.csh.org.tw/query_cumulative_lab_data?visitNo=${pt.visitNo}`,
+        {credentials:'include'}).then(r=>r.json())
+    ]);
+
+    // 條件一：FiO2/PEEP 上升（比較今日與昨日班務記錄）
+    const getVentVal = (notes, date, key) => {
+      const note = notes.filter(r=>r.RecordTime.startsWith(date)&&r.RecordTypeName?.includes('班務'))
+        .sort((a,b)=>b.RecordTime.localeCompare(a.RecordTime))[0];
+      const m = note?.Content?.match(new RegExp(key+'[:\\s]*(\\d+)','i'));
+      return m ? parseInt(m[1]) : null;
+    };
+    const fio2Today = getVentVal(nursing, today, 'FiO2');
+    const fio2Yest  = getVentVal(nursing, yesterday, 'FiO2');
+    const peepToday = getVentVal(nursing, today, 'PEEP');
+    const peepYest  = getVentVal(nursing, yesterday, 'PEEP');
+    const ventRising = (fio2Today > fio2Yest) || (peepToday > peepYest);
+
+    // 條件二：今日膿痰
+    const purulentSputum = nursing.some(r =>
+      r.RecordTime.startsWith(today) &&
+      /黃綠|膿痰|purulent|黃色|綠色|thick.*yellow|green/i.test(r.Content||''));
+
+    // 條件三：WBC/CRP 上升（最新值 vs 前一筆）
+    const getLabTrend = (labData, keyword) => {
+      const items = labData.filter(d=>d.TranCode==='9'&&d.ShortName?.includes(keyword))
+        .sort((a,b)=>b.LabDate.localeCompare(a.LabDate));
+      if (items.length < 2) return null;
+      return parseFloat(items[0].ReportValue) > parseFloat(items[1].ReportValue);
+    };
+    const wbcRising = getLabTrend(lab, 'WBC');
+    const crpRising = getLabTrend(lab, 'CRP');
+    const inflammRising = wbcRising || crpRising;
+
+    return {
+      ...pt,
+      ventRising, purulentSputum, inflammRising,
+      alert: ventRising && purulentSputum && inflammRising
+    };
+  }));
+
+  return results.filter(r=>r.alert)
+    .map(r=>`⚠️ ${r.bed} ${r.name}: FiO2/PEEP↑, 膿痰, WBC/CRP↑`);
+})();
+```
+
+> ⚠️ FiO2/PEEP 解析格式待確認（見 RT-1）。
+
+---
+
+### RT-12：困難脫離病患 — I/O + CVP + RSBI 趨勢
+
+**目標**：近三天累計 I/O 平衡、CVP 走勢，對照每日 SBT 的 RSBI 變化。
+
+**資料來源**：
+
+| 資料 | 來源 | 狀態 |
+|---|---|---|
+| 累計 I/O | `get_io?visitNo=` | ⚠️ API 格式待確認 |
+| CVP | `get_vital_sign` 或護理班務記錄 | ⚠️ 需確認 CVP 是否在 vital sign API |
+| RSBI (f/Vt) | 護理紀錄自由文字 | 需確認是否有記錄 |
+
+**RSBI 從護理紀錄解析**（format 待確認）：
+```javascript
+window._nursing
+  .filter(r => /RSBI|f\/Vt|淺快呼吸/i.test(r.Content||''))
+  .sort((a,b)=>a.RecordTime.localeCompare(b.RecordTime))
+  .map(r => {
+    const m = r.Content.match(/RSBI[:\s]*(\d+)/i);
+    return {date: r.RecordTime.slice(0,10), rsbi: m?parseInt(m[1]):null, note: r.Content};
+  });
+```
+
+**趨勢圖（matplotlib，待 I/O 和 CVP 資料確認後補完）**：
+```python
+# 三天資料繪製：
+# 上圖：每日 I/O 平衡（正值=液體過多, 負值=液體不足）
+# 中圖：CVP 走勢
+# 下圖：RSBI（<105 = 可能可脫離）
+```
+
+> ⚠️ 此情境高度依賴 `get_io` 和 CVP 資料來源，回醫院確認後補完。
+
+---
+
+### RT-13：全區混合型酸鹼失衡 + Lactate + Anion Gap + 動態尿量
+
+**目標**：篩出混合型酸鹼失衡病人（如代酸 + 呼酸），附 Lactate、Anion Gap 與近 8 小時尿量。
+
+**步驟**：
+
+**Phase 1 — 全病房 ABG 掃描**：
+```javascript
+(async () => {
+  const patients = [ /* 病房名單 */ ];
+  const today = '2026-05-14';
+
+  const results = await Promise.all(patients.map(async pt => {
+    const lab = await fetch(
+      `https://hapi.csh.org.tw/query_cumulative_lab_data?visitNo=${pt.visitNo}`,
+      {credentials:'include'}).then(r=>r.json());
+
+    // 最新一次 ABG（今日）
+    const todayLab = lab.filter(d=>d.TranCode==='9'&&(d.LabDate||'').startsWith(today));
+    const get = (key) => parseFloat(
+      todayLab.find(d=>d.ShortName?.includes(key))?.ReportValue||'NaN');
+
+    const pH   = get('pH');
+    const pCO2 = get('pCO2') || get('CO2');
+    const hco3 = get('HCO3') || get('bicarbonate');
+    const na   = get('Na');
+    const cl   = get('Cl');
+    const lactate = get('Lactate') || get('乳酸');
+
+    // Anion Gap = Na - (Cl + HCO3)
+    const ag = na - (cl + hco3);
+
+    // 混合型酸鹼判斷
+    const metAcidosis  = pH < 7.35 && hco3 < 22;   // 代謝性酸中毒
+    const respAcidosis = pH < 7.35 && pCO2 > 45;    // 呼吸性酸中毒
+    const mixedAcid    = metAcidosis && respAcidosis;
+    // 其他混合型可依需求擴充（如呼酸+代鹼等）
+
+    return {...pt, pH, pCO2, hco3, ag, lactate, mixedAcid};
+  }));
+
+  window._acidPts = results.filter(r=>r.mixedAcid);
+  return window._acidPts.map(r=>
+    `${r.bed}: pH=${r.pH} pCO2=${r.pCO2} HCO3=${r.hco3} AG=${r.ag} Lactate=${r.lactate}`);
+})();
+```
+
+**Phase 2 — 對警示床位查近 8 小時尿量**：
+```javascript
+// 從護理紀錄找尿量記錄
+const from = '2026-05-14T02:00';
+const to   = '2026-05-14T10:00';
+window._nursing
+  .filter(r => r.RecordTime >= from && r.RecordTime <= to &&
+    /尿量|urine|UO|foley|小便/i.test(r.Content||''))
+  .sort((a,b)=>a.RecordTime.localeCompare(b.RecordTime))
+  .map(r=>`[${r.RecordTime.slice(11,16)}] ${r.Content}`);
+```
+
+**呈現格式**：
+```
+全區混合型酸鹼失衡（2026-05-14 早班）
+
+MI03 張OO：
+  ABG: pH 7.20 | pCO2 55 | HCO3 16（代酸＋呼酸 ⚠）
+  Anion Gap: 18（升高，>12 ⚠）
+  Lactate: 4.2 mmol/L ⚠
+  近 8h 尿量：約 80 mL（少尿 ⚠）
+  → 建議評估：敗血症/低灌流/腎功能惡化
+```
+
+---
+
+### RT-14：HFCWO 醫囑 + 痰量分級 + PT 排程確認
+
+**目標**：列出有開 HFCWO（高頻胸壁震盪/拍痰背心）的病人，比對痰量與 PT 頻率是否足夠。
+
+**步驟**：
+
+**1. 找 HFCWO 醫囑**（patient_treatments 或 patient_orders）：
+```javascript
+const tx = await fetch(`https://hapi.csh.org.tw/patient_treatments?visitNo=XXXXXXXX`,
+  {credentials:'include'}).then(r=>r.json());
+tx.filter(t => /HFCWO|拍痰背心|高頻|chest.*oscill|vest/i.test(t.ItemName||''));
+```
+
+> ⚠️ HFCWO 的醫囑代碼和所在 API（treatments 或 orders）待回醫院確認。
+
+**2. 從護理紀錄分析痰量與黏稠度**：
+```javascript
+// 近三天痰量/黏稠度記錄
+const threeDays = ['2026-05-12','2026-05-13','2026-05-14'];
+window._nursing
+  .filter(r => threeDays.some(d=>r.RecordTime.startsWith(d)) &&
+    /痰量|sputum|抽痰|黏稠|稀薄|濃稠|量多|量少/i.test(r.Content||''))
+  .sort((a,b)=>a.RecordTime.localeCompare(b.RecordTime))
+  .map(r=>`[${r.RecordTime.slice(0,16)}] ${r.Content}`);
+```
+
+**3. PT 排程**（patient_orders 或 patient_treatments 找物理治療相關）：
+```javascript
+tx.filter(t => /物理治療|PT|胸腔|chest.*physio|呼吸治療/i.test(t.ItemName||''));
+```
+
+> ⚠️ PT 排程的 API 和頻次欄位待確認。
+
+---
+
+### RT-15：心臟術後/心衰竭 — SBT 期間心肺交互監測
+
+**目標**：PEEP 調降或 SBT 期間，偵測 PVC、心跳過速、MAP 掉落 > 20%。
+
+> ⚠️ **高難度情境**：需要時序精確的心律/MAP 資料，目前有以下限制：
+
+**可行部分（護理紀錄）**：
+```javascript
+// 找 SBT 期間護理記錄的異常描述
+const sbtTime = '2026-05-14T09:00';  // SBT 開始時間
+const from = sbtTime;
+const to   = '2026-05-14T10:00';
+window._nursing
+  .filter(r => r.RecordTime >= from && r.RecordTime <= to &&
+    /PVC|心律|arrhythmia|心跳過速|tachycardia|MAP|血壓下降|PEEP/i.test(r.Content||''))
+  .map(r=>`[${r.RecordTime.slice(11,16)}] ${r.Content}`);
+```
+
+**待確認**：
+- `get_vital_sign` 是否有足夠時間解析度記錄 MAP 變化？
+- PVC/心律不整是否有獨立的心電圖/telemetry API？
+- 若上述均無，則此情境只能從護理自由文字間接判斷
+
+---
+
+### RT-16：轉送 CT 前氧氣消耗試算 + 鎮靜醫囑
+
+**目標**：依 Ve 與 FiO2 估算氧氣鋼瓶消耗時間，並確認轉送前鎮靜加強醫囑。
+
+**步驟**：
+
+**1. 從護理紀錄取目前呼吸器設定（Ve、FiO2）**：
+```javascript
+const latestNote = window._nursing
+  .filter(r=>r.RecordTypeName?.includes('班務'))
+  .sort((a,b)=>b.RecordTime.localeCompare(a.RecordTime))[0];
+// 解析：Ve（分鐘通氣量）、FiO2
+const veMatch  = latestNote?.Content?.match(/Ve[:\s]*([\d.]+)/i);
+const fio2Match = latestNote?.Content?.match(/FiO2[:\s]*(\d+)/i);
+const ve   = veMatch  ? parseFloat(veMatch[1])  : null;  // L/min
+const fio2 = fio2Match? parseInt(fio2Match[1])/100 : null;
+```
+
+**2. 氧氣消耗試算（Python）**：
+```python
+# 呼吸器使用純氧補充公式（簡化估算）
+# 實際 O2 flow ≈ Ve × FiO2（若空氣與O2混合）
+# 或依呼吸器機型查混合比
+
+ve   = 8.0   # L/min（從護理記錄取得）
+fio2 = 0.50  # 50%
+
+# 標準氧氣鋼瓶規格
+cylinders = {
+  'E瓶': 660,    # 容積約 660L（常見攜帶型）
+  'D瓶': 415,
+}
+
+# 估算 O2 消耗速率（近似：FiO2 > 21% 的額外需氧量）
+o2_flow_lpm = ve * fio2  # 粗估
+for name, vol in cylinders.items():
+  minutes = vol / o2_flow_lpm
+  print(f"{name}：約可用 {minutes:.0f} 分鐘（{minutes/60:.1f} 小時）")
+
+# 建議：CT 轉送含等待時間約 30–60 分鐘，至少備 2 倍餘裕
+```
+
+**3. 確認鎮靜加強醫囑**：
+```javascript
+// patient_drugs 篩鎮靜相關 STAT 或 PRN 醫囑
+const drugs = await fetch(`https://hapi.csh.org.tw/patient_drugs?visitNo=XXXXXXXX`,
+  {credentials:'include'}).then(r=>r.json());
+drugs.filter(d => /fentanyl|midazolam|propofol|ketamine|versed|dormicum/i
+  .test(d.DrugName||d.OrderName||''));
+```
+
+**呈現格式**：
+```
+MI07 轉送 Chest CT 氧氣評估
+
+目前設定：Mode SIMV, FiO2 50%, Ve 8.0 L/min
+
+氧氣消耗估算：
+  E 瓶（660L）：約可用 99 分鐘 → 轉送 60 分鐘尚足夠，建議備 1 瓶
+  若等待超過 90 分鐘：需備 2 瓶 E 瓶
+
+轉送前鎮靜醫囑：
+  Midazolam 2mg IV PRN（已開立）✓
+  → 確認是否需追加 STAT 劑量，請與醫師確認
+```
+
+---
+
+### RT-17：Bedside Bronchoscopy 術後即時監測
+
+**目標**：支氣管鏡術後追蹤 FiO2 需求、PIP 趨勢、Vte 變化。
+
+**步驟**：
+
+```javascript
+// 指定術後監測時間窗（如 11:00 後 2 小時）
+const procEnd = '2026-05-14T11:00';
+const monEnd  = '2026-05-14T13:00';
+
+// 護理紀錄篩術後監測記錄
+const postProc = window._nursing
+  .filter(r => r.RecordTime >= procEnd && r.RecordTime <= monEnd)
+  .sort((a,b)=>a.RecordTime.localeCompare(b.RecordTime));
+
+// 三個警示條件
+const fio2Rising = postProc.some(r=>/FiO2.*上升|FiO2.*升高|FiO2.*increase|需氧上升/i.test(r.Content||''));
+const pipHigh    = postProc.some(r=>/PIP.*高壓|高壓.*警報|PIP.*limit|PIP.*top|PIP[:\s]*[4-9]\d/i.test(r.Content||''));
+const vteDown    = postProc.some(r=>/Vte.*下降|通氣量.*減少|tidal.*drop|Vte[:\s]*[1-2]\d{2}[^\d]/i.test(r.Content||''));
+
+// 解析數值變化
+const events = postProc.map(r=>`[${r.RecordTime.slice(11,16)}] ${r.RecordTypeName}: ${r.Content}`);
+```
+
+**警示判斷**：
+
+| 警示 | 判斷條件 | 臨床意義 |
+|---|---|---|
+| FiO2 急遽上升 | 術後 FiO2 較術前增加 ≥ 10% | 術後低氧、出血、分泌物堵塞 |
+| PIP 持續頂高壓上限 | PIP > 設定上限 | 氣道阻力增加、分泌物殘留 |
+| Vte 顯著衰退 | 自發通氣量 < 術前 20% | 呼吸肌疲勞、鎮靜過深 |
+
+**呈現格式**：
+```
+第二床 Bronchoscopy 術後監測（11:00–13:00）
+
+⚠️ 警示：
+  FiO2 由 40% 升至 55%（術後 30 分鐘）⚠
+  PIP 達 38 cmH2O（高壓上限 40）⚠
+  Vte 維持穩定（無明顯衰退）✓
+
+事件時間軸：
+  [11:05] FiO2 調升至 50%
+  [11:20] PIP 升至 35，通知醫師
+  [11:35] 抽痰，大量血性分泌物
+  [11:50] PIP 回降至 28，FiO2 調回 45%
+
+建議：持續監測，若 PIP 再升考慮重複支氣管鏡。
+```
+
+---
+
 ## Token 過期處理
 
 症狀：查詢回傳 `"無法載入 XX 病房名單"`

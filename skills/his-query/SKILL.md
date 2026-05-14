@@ -677,6 +677,145 @@ CCU 呼吸支持現況（2026-05-14）
 
 ---
 
+### 情境十五：特定班別的特殊處置
+
+**目標**：找出某班別期間護理記錄中的「處置」類型紀錄（與情境九的差別：情境九看全部事件，這裡只看處置）。
+
+**步驟**：
+
+```javascript
+window._nursing = null;
+fetch('https://hapi.csh.org.tw/get_nursing_records?visitNo=XXXXXXXX',
+  {credentials:'include'}).then(r=>r.json()).then(d=>{window._nursing=d;});
+
+// 小夜班（15:00–23:00）處置紀錄
+(() => {
+  const from = '2026-05-14T15:00';
+  const to   = '2026-05-14T23:00';
+  return window._nursing
+    .filter(r =>
+      r.RecordTime >= from && r.RecordTime <= to &&
+      (r.RecordTypeName?.includes('處置') || r.RecordTypeName?.includes('治療'))
+    )
+    .sort((a,b) => a.RecordTime.localeCompare(b.RecordTime))
+    .map(r => `[${r.RecordTime.slice(11,16)}] ${r.RecordTypeName} ${r.CreateUser}: ${r.Content}`);
+})()
+```
+
+> 若要看全部事件（不限處置），參考情境九。
+
+**呈現格式**：
+```
+MI06 小夜班特殊處置（2026-05-14 15:00–23:00）
+
+  [16:30] 處置 護士A：抽血送培養（血液 × 2 套）
+  [18:00] 治療 護士A：更換中央靜脈導管敷料
+  [21:00] 處置 護士B：插入鼻胃管，確認位置後開始灌食
+```
+
+---
+
+### 情境十六：檢驗趨勢圖（matplotlib）
+
+**目標**：將多天的檢驗數值（如腎功能、電解質）繪製成折線圖，在對話中顯示。
+
+**適用場景**：近 N 天/兩周/一個月的趨勢分析。
+
+**步驟**：
+
+1. Chrome MCP 取原始資料（以腎功能為例）：
+   ```javascript
+   window._lab = null;
+   fetch('https://hapi.csh.org.tw/query_cumulative_lab_data?visitNo=XXXXXXXX',
+     {credentials:'include'}).then(r=>r.json()).then(d=>{window._lab=d;});
+   // 等完成後，篩腎功能項目
+   (() => {
+     const renal = ['Cr', 'BUN', 'Na', 'K', 'Cl', 'HCO3', 'Uric'];
+     return JSON.stringify(
+       window._lab
+         .filter(d => d.TranCode==='9' && renal.some(k => d.ShortName?.includes(k)))
+         .map(d => ({date: (d.LabDate||'').slice(0,10), item: d.ShortName,
+                     value: parseFloat(d.ReportValue), unit: d.Unit, abnormal: d.IsAbnormal}))
+     );
+   })()
+   ```
+
+2. 將資料貼入 Python，用 matplotlib 生成圖表：
+   ```python
+   import json, matplotlib
+   matplotlib.use('Agg')
+   import matplotlib.pyplot as plt
+   import matplotlib.dates as mdates
+   from datetime import datetime
+   
+   # 貼上步驟1的 JSON 輸出
+   raw = json.loads('...')
+   
+   # 分項目整理
+   items = {}
+   for r in raw:
+       items.setdefault(r['item'], []).append((r['date'], r['value']))
+   
+   fig, axes = plt.subplots(len(items), 1, figsize=(10, 3*len(items)), sharex=True)
+   if len(items) == 1: axes = [axes]
+   
+   for ax, (item, pts) in zip(axes, items.items()):
+       pts.sort()
+       dates = [datetime.strptime(d, '%Y-%m-%d') for d, _ in pts]
+       vals  = [v for _, v in pts]
+       ax.plot(dates, vals, 'o-', linewidth=2)
+       ax.set_ylabel(item)
+       ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d'))
+       ax.grid(True, alpha=0.3)
+   
+   plt.suptitle('腎功能趨勢（近兩周）', fontsize=14)
+   plt.tight_layout()
+   plt.savefig(r'D:\Users\YUAN\Desktop\his_crawler\tmp_trend.png', dpi=120)
+   plt.close()
+   print('done')
+   ```
+
+3. 用 `Read` tool 讀取 `tmp_trend.png` → 圖表顯示在對話中。
+
+**可繪製的趨勢組合**：
+
+| 主題 | 項目 |
+|---|---|
+| 腎功能 | Cr、BUN |
+| 電解質 | Na、K、Cl、HCO3（或 CO2） |
+| 肝功能 | ALT、AST、T-Bil |
+| 感染指標 | WBC、CRP、PCT |
+| ABG | pH、pCO2、pO2、HCO3、BE |
+
+> 若需要中文字型（項目名稱有中文），需先確認系統有安裝中文字型，或改用英文縮寫。
+
+---
+
+### 情境十七：心導管（CATH）報告
+
+**目標**：取得心導管檢查的影像與文字報告。
+
+**影像部分**（流程同 CXR，已確認可行）：
+
+1. 取 `chartno`（從 `patient_info`）
+2. 取影像清單，篩心導管相關：
+   ```javascript
+   const studies = await fetch(
+     `https://hapi.csh.org.tw/get_oracle_pacs_study_list?chartno=${chartno}`,
+     {credentials:'include'}).then(r=>r.json());
+   // 識別關鍵字：CATH、Coronary、Angio、心導管、冠狀動脈
+   const cath = studies
+     .filter(s => /cath|coronary|angio|心導管|冠狀/i.test(s.StudyDesc))
+     .sort((a,b) => b.StudyDateTime.localeCompare(a.StudyDateTime));
+   JSON.stringify(cath.slice(0,3).map(s=>({date:s.StudyDateTime.slice(0,10), desc:s.StudyDesc})));
+   ```
+3. 取 `sop_instance_uid` → PowerShell WADO 下載 → `Read` tool 呈現
+
+**文字報告（心導管結果、病灶描述）**：
+> ⚠️ **待確認**（同情境六）：放射科/心臟科文字報告 API 尚未找到。回醫院後攔截 network 確認。
+
+---
+
 ## Token 過期處理
 
 症狀：查詢回傳 `"無法載入 XX 病房名單"`

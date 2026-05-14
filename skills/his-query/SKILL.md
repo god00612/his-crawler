@@ -30,6 +30,35 @@ data = json.loads(result.stdout.decode('utf-8'))
 
 工作目錄：`D:\Users\YUAN\Desktop\his_crawler`
 
+## 核心查詢邏輯
+
+**先廣後深**：大多數臨床問題，從護理紀錄 + 醫師交班就能得到足夠的答案。只有在需要更精確的數值或結構化資料時，才去打對應的專屬 API。
+
+```
+使用者問題
+  │
+  ▼
+【第一層】護理紀錄 + 醫師交班（廣，通常夠用）
+  get_nursing_records?visitNo=   → 發生了什麼事、做了什麼處置、pump 速率、灌食
+  get_medSummary?visitNo=        → 醫師的判斷、治療計劃、病情變化摘要
+  │
+  ├─ 答案已足夠 → 直接回答
+  │
+  └─ 需要更精確 → 【第二層】專屬 API（精，結構化）
+       檢驗數值  → query_cumulative_lab_data
+       用藥清單  → patient_drugs
+       治療處置  → patient_treatments
+       影像      → PACS 流程
+       IO        → get_io
+```
+
+**實際應用**：
+- 「MI06 小夜班發生什麼事？」→ 直接查護理紀錄篩小夜班，通常不需再打其他 API
+- 「MI06 用了什麼抗生素？」→ 護理班務記錄會提到藥名，若需要劑量/頻次才去查 `patient_drugs`
+- 「MI05 有長菌嗎？」→ 護理紀錄可能提到培養結果，若要完整藥敏報告才去查 `query_cumulative_lab_data`
+
+---
+
 ## 問題焦點對應欄位
 
 | 使用者問題 | 要看的欄位 |

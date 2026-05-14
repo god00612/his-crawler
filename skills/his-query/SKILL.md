@@ -361,6 +361,118 @@ data = json.loads(result.stdout.decode('utf-8'))
 
 ---
 
+### 情境八：入院經過 / 入 ICU 經過 / 手術紀錄
+
+**目標**：整理病人為何入院、為何入 ICU、本次住院進行了哪些手術。
+
+**步驟**：
+
+1. 取基本資料（入院診斷、入院日期）：
+   ```javascript
+   const info = await fetch('https://hapi.csh.org.tw/patient_info?visitNo=XXXXXXXX',
+     {credentials:'include'}).then(r=>r.json());
+   // 關注欄位：AdmDiagnosis、AdmDate、ChartNo、PtName
+   JSON.stringify({
+     name: info.PtName,
+     admDate: info.AdmDate,
+     diagnosis: info.AdmDiagnosis
+   });
+   ```
+
+2. 取醫師交班紀錄，找最早幾筆（入院/入ICU時的紀錄）與最近紀錄：
+   ```javascript
+   const summary = await fetch('https://hapi.csh.org.tw/get_medSummary?visitNo=XXXXXXXX',
+     {credentials:'include'}).then(r=>r.json());
+   // 最早 3 筆（入科經過）+ 最近 3 筆（目前狀況）
+   JSON.stringify({
+     early: summary.slice(0, 3),
+     recent: summary.slice(-3)
+   });
+   ```
+
+3. 手術相關資料 — 查 `patient_treatments`，篩手術/OR 相關項目：
+   ```javascript
+   const tx = await fetch('https://hapi.csh.org.tw/patient_treatments?visitNo=XXXXXXXX',
+     {credentials:'include'}).then(r=>r.json());
+   // 篩手術相關費用項目（關鍵字：手術、OR、麻醉、刀）
+   tx.filter(t => /手術|OR|麻醉|刀|開刀/.test(t.ItemName||''));
+   ```
+
+> ⚠️ **待確認**：正式手術紀錄（術式、術者、麻醉方式）可能在獨立的手術系統，不在上述 API 中。回醫院後確認：選病人後 network log 是否有手術相關 API（如 `get_operation`、`or_record` 等）。
+
+**呈現格式**：
+```
+病人：王OO，入院日期：2026-05-10
+入院診斷：Septic shock, pneumonia
+
+入ICU經過（最早交班）：
+  [2026-05-10 10:00] 因發燒、血壓下降由急診收入 MICU...
+
+目前狀況（最近交班）：
+  [2026-05-14 08:00] 血壓穩定，升壓劑逐漸減量...
+
+手術紀錄：
+  [2026-05-12] 氣管切開術（tracheostomy）
+```
+
+---
+
+### 情境九：特定班別發生了什麼事
+
+**目標**：快速了解某班別（大夜/小夜/白天）期間的重要事件，包含病情變化、緊急處置、醫師指示。
+
+**時間區間**：
+| 班別 | 時間 |
+|---|---|
+| 白天 | 07:00–15:00 |
+| 小夜 | 15:00–23:00 |
+| 大夜 | 23:00–07:00（跨午夜） |
+
+**步驟**：
+
+1. 取護理紀錄，篩指定班別時間：
+   ```javascript
+   window._nursing = null;
+   fetch('https://hapi.csh.org.tw/get_nursing_records?visitNo=XXXXXXXX',
+     {credentials:'include'}).then(r=>r.json()).then(d=>{window._nursing=d;});
+   // 大夜班（昨晚23:00 ~ 今日07:00）
+   (() => {
+     const from = '2026-05-13T23:00';
+     const to   = '2026-05-14T07:00';
+     return window._nursing
+       .filter(r => r.RecordTime >= from && r.RecordTime <= to)
+       .sort((a,b) => a.RecordTime.localeCompare(b.RecordTime))
+       .map(r => `[${r.RecordTime.slice(11,16)}] ${r.RecordTypeName} ${r.CreateUser}: ${r.Content}`);
+   })()
+   ```
+
+2. 取該班的醫師交班紀錄：
+   ```javascript
+   const summary = await fetch('https://hapi.csh.org.tw/get_medSummary?visitNo=XXXXXXXX',
+     {credentials:'include'}).then(r=>r.json());
+   // 篩大夜班交班（ShiftType 含「大夜」）
+   summary.filter(s => s.ShiftType?.includes('大夜'))
+     .map(s => `[${s.RecordTime}] ${s.RecordUser}: ${s.Summary}`);
+   ```
+
+3. 整合兩個資料來源，依時間排序呈現。
+
+**呈現格式**：
+```
+MI03 大夜班（2026-05-13 23:00 ~ 2026-05-14 07:00）
+
+護理紀錄：
+  [23:15] 班務記錄 護士A：血壓下降至 80/50，通知值班醫師...
+  [23:30] 緊急處置 護士A：開始 norepinephrine 0.1 mcg/kg/min...
+  [02:00] 班務記錄 護士B：血壓回穩 110/70，升壓劑維持...
+  [06:00] 班務記錄 護士B：生命徵象穩定，準備交班...
+
+醫師大夜交班：
+  [07:00] 主治醫師 陳OO：昨晚血壓不穩，給予補液及升壓劑後改善...
+```
+
+---
+
 ## Token 過期處理
 
 症狀：查詢回傳 `"無法載入 XX 病房名單"`

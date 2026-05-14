@@ -1174,12 +1174,82 @@ MI07 營養狀況（2026-05-14）
 
 ## 呼吸治療師（RT）專用情境
 
-> **共同前提**：呼吸器設定記錄在護理 **VITALSIGN** 型別記錄中（非班務記錄），每小時自動產生一筆。格式如下：
+### Maya RCS 系統（呼吸治療資訊管理系統）
+
+**系統位置**：`http://maya-ap/RCS_CSH/`（院內網路，與 HIS 獨立）
+
+**登入流程（Chrome MCP）**：
+```javascript
+// 1. 導航到登入頁
+// navigate tabId to: http://maya-ap/RCS_CSH/index.html#/Login
+
+// 2. 填帳號密碼並點登入（Vue SPA，用 form_input + button.click()）
+// read_page → ref_1=帳號, ref_2=密碼, ref_3=登入按鈕
+
+// 3. 登入後取 Bearer token
+const token = sessionStorage.getItem('Authorization');  // 'Bearer eyJ...'
+
+// 4. 後續 API 呼叫需帶此 header
+headers: {'Content-Type':'application/json', 'Authorization': token}
+```
+
+**最可靠的資料取得方式：DOM 解析**（登入後主畫面已渲染完整清單）
+```javascript
+// 主畫面 URL: #/Main/RT/rtStatus/List/YYYYMMDDHHMMSS
+const rows = [...document.querySelectorAll('table tbody tr')];
+const data = rows.map(r => {
+  const cells = [...r.querySelectorAll('td')].map(td => td.innerText.trim().replace(/\s+/g,' '));
+  if (cells.length < 7) return null;
+  const ventRaw = cells[7] || '';
+  return {
+    bed:      cells[1],
+    chartno:  cells[2],
+    name:     cells[3].replace(/^住\s*/,''),
+    age:      cells[4],
+    diag:     cells[5],
+    mvDays:   cells[6],          // MV 天數
+    device:   ventRaw.split(' ')[0],   // 機器型號（EvitaV300/V500/Prisma50c等）
+    settings: ventRaw.replace(/^\S+\s*/,''), // PC:xx PEEP:xx Set RR:xx FiO2:xx
+    hhDate:   cells[8],          // HH（加溫濕化器）更換日期
+    tubeDate: cells[9],          // 換管日期
+    remark:   cells[10]          // 完整備註（含治療計畫、異常檢驗、CXR等）
+  };
+}).filter(r => r && r.bed);
+
+// 篩 MI 病房
+data.filter(p => p.bed?.startsWith('MI'));
+```
+
+**DOM 欄位說明**：
+
+| 欄位 | 說明 | 範例 |
+|---|---|---|
+| `device` | 呼吸器型號 | EvitaV300/EvitaV500/Prisma50c/NC/SM |
+| `settings` | 完整呼吸器設定字串 | `PC: 24 PEEP: 8.0 Set RR: 18 FiO2: 40` |
+| `mvDays` | 累積 MV 天數 | `72` |
+| `hhDate` | HH 更換日期 | `2026-03-11` |
+| `tubeDate` | 換管日期 | `2026-03-18` |
+| `remark` | RT 備註（治療計畫/CXR/Lab/會議紀錄） | 自由文字，最完整 |
+
+**Vuex state 備用**（settings 多數為 null，以 DOM 為主）：
+```javascript
+const vuex = JSON.parse(sessionStorage.getItem('vuex') || '{}');
+const patList = vuex?.RT?.patList || [];  // 含 machine.ipd_no / machine.chart_no 等
+```
+
+**API 端點**（需 Bearer token，body 格式待完整確認）：
+- `POST /api/RtStatus/List` → 機器狀態清單
+- `POST /api/rtRecord/getRtRrecordList` → 呼吸照護紀錄單（空 body 回傳 []，需帶參數）
+
+---
+
+> **共同前提**：呼吸器設定亦記錄在 HIS 護理 **VITALSIGN** 型別記錄中（非班務記錄），每小時自動產生一筆。格式如下：
 > ```
 > 呼吸器：機型:EV300, Mode:PACV,呼吸次數:14次/分鐘,氧氣濃度:35％,吐氣末陽壓:8cmH2O,壓力:22cmH2O
 > ```
 > - 篩選方式：`RecordType === 'VITALSIGN'` + `Content` 含 `呼吸器：`
 > - FiO2 → `氧氣濃度`（後接 `％`）；PEEP → `吐氣末陽壓`（後接 `cmH2O`）；Mode → `Mode:`；RR → `呼吸次數`；PC 壓力 → `壓力:`
+> - **Maya RCS 為最直接來源**（含 MV 天數/換管日期/HH 日期/RT 備註），HIS VITALSIGN 作為補充或即時數值。
 
 ---
 

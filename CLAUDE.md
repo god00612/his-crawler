@@ -196,6 +196,27 @@ Direct fetch works: `get_inPatient?ward=MI` returns all patients with `VisitNo`/
 - URL: `get_bed_records?chartno=XXXXXX` (or `?visitNo=`)
 - Returns bed history; current bed = record where `DischargeTime===''`, sorted by `StartTime` desc
 
+### Maya RCS system (呼吸治療資訊管理系統)
+
+Separate system at `http://maya-ap/RCS_CSH/` — independent from HIS, requires own login.
+
+**Login**: Navigate to `http://maya-ap/RCS_CSH/index.html#/Login` (Vue SPA). Fill `#user_id` / `#user_pwd` via `form_input`, click login button. On success, redirects to `#/Main/RT/rtStatus/List/YYYYMMDDHHMMSS`.
+
+**Auth token**: Stored in `sessionStorage.Authorization` as `'Bearer eyJ...'` after login. Required header for all API calls.
+
+**Data extraction (DOM parse — most reliable)**:
+Main page table has one row per patient. Column index:
+- `cells[1]` = bed (e.g. MI01), `cells[2]` = chartno, `cells[3]` = name (prefix 住)
+- `cells[4]` = age, `cells[5]` = diagnosis, `cells[6]` = MV days
+- `cells[7]` = device + settings string (e.g. `EvitaV300 PC: 24 PEEP: 8.0 Set RR: 18 FiO2: 40`)
+- `cells[8]` = HH change date, `cells[9]` = tube change date, `cells[10]` = full RT remark
+
+**APIs** (POST, need Authorization header):
+- `/api/RtStatus/List` — machine status list (body params TBD)
+- `/api/rtRecord/getRtRrecordList` — RT care records (body params TBD, empty body returns [])
+
+**Vuex state** in `sessionStorage.vuex`: `RT.patList[]` contains `machine.ipd_no`/`machine.chart_no` per patient (most numeric fields null — DOM is the authoritative source).
+
 **Selecting a patient fires all 22 APIs at once**: Use `form_input` to select a patient's `visitNo` in the patient dropdown — HIS immediately fires all background API calls. Capture all URLs via `read_network_requests` and fetch whichever ones are needed. This replaces the Playwright 15-second wait loop entirely. The 22 APIs include: `patient_info`, `visit_history`, `get_io`, `get_pump_records`, `get_personal_note`, `patient_treatments`, `get_vital_sign`, `patient_body_record`, `get_pre_admin_orders`, `get_pharmacyReview_record`, `patient_orders`, `get_medSummary`, `get_nursing_records`, `patient_problems`, `med_allergy`, `allergy_cloud_query`, `patient_drugs`, `query_cumulative_lab_data`.
 
 **Limitations**:

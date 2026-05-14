@@ -473,6 +473,80 @@ MI03 大夜班（2026-05-13 23:00 ~ 2026-05-14 07:00）
 
 ---
 
+### 情境十：用病歷號（chartno）查病人目前所在單位
+
+**目標**：已知病歷號，不知道病人目前在哪個病房/單位。
+
+> ⚠️ **待確認**：目前不知道是否有 `search_patient?chartno=` 類型的 API。
+
+**待確認事項**（回醫院後）：
+- 在 HIS 搜尋框輸入病歷號時，瀏覽器發出哪個 API？
+- 回傳內容是否包含目前所在病房（Ward、RoomBed）？
+- 是否可以用 `chartno` 直接取得目前的 `visitNo`？
+
+**暫用方法**：
+- 如果知道病人大約在哪個病房，用該病房名單（`get_inPatient`）掃描 `ChartNo` 欄位比對
+
+---
+
+### 情境十一：查特定醫囑是否開立（order code）
+
+**目標**：確認病人是否有開立特定醫囑，例如呼吸器相關 order（代碼 57001）。
+
+> ⚠️ **待確認**：`patient_orders` API 是否支援 `?visitNo=` 直接查，以及欄位結構。
+
+**待確認事項**（回醫院後）：
+- 選病人後攔截 `patient_orders` URL → 確認是否可直接用 `?visitNo=`
+- 回傳欄位中醫囑代碼的欄位名稱（`OrderCode`？`ItemCode`？`OrderNo`？）
+- 篩選方式：用代碼精確比對，或用醫囑名稱關鍵字搜尋
+
+**暫用方向**：
+```javascript
+// 取 patient_orders（URL 從 network log 攔截）
+const orders = await fetch('https://hapi.csh.org.tw/patient_orders?encrypted=...&nonce=...',
+  {credentials:'include'}).then(r=>r.json());
+// 篩特定代碼或名稱
+orders.filter(o => o.OrderCode === '57001' || o.OrderName?.includes('呼吸器'));
+```
+
+---
+
+### 情境十二：腦部影像（Brain CT / MRI）
+
+**目標**：取得病人最近的 Brain CT 或 MRI 影像（及文字報告，如可取得）。
+
+**影像部分**（流程同 CXR，已確認可行）：
+
+1. 取 `chartno`（從 `patient_info`）
+2. 取影像清單，篩 Brain CT / MRI：
+   ```javascript
+   const studies = await fetch(
+     `https://hapi.csh.org.tw/get_oracle_pacs_study_list?chartno=${chartno}`,
+     {credentials:'include'}).then(r=>r.json());
+   // 識別關鍵字：Brain、Head、CT、MRI、頭部、顱
+   const brain = studies
+     .filter(s => /brain|head|MRI|CT brain|頭部|顱/i.test(s.StudyDesc))
+     .sort((a,b) => b.StudyDateTime.localeCompare(a.StudyDateTime));
+   JSON.stringify(brain.slice(0,3).map(s=>({date:s.StudyDateTime.slice(0,10), desc:s.StudyDesc, accNo:s.ACCESSION_NO})));
+   ```
+3. 取 `sop_instance_uid` → PowerShell WADO 下載 → `Read` tool 呈現（同 CXR 流程）
+
+**文字報告部分**：
+> ⚠️ **待確認**（同情境六）：放射科文字報告（findings / impression）的 API 尚未找到。回醫院後在 HIS 點開報告時攔截 network request 確認。
+
+**呈現格式**：
+```
+Brain CT（2026-05-12）
+[影像]
+
+Brain MRI（2026-05-10）
+[影像]
+
+放射科報告：⚠️ 待確認 API
+```
+
+---
+
 ## Token 過期處理
 
 症狀：查詢回傳 `"無法載入 XX 病房名單"`

@@ -1,0 +1,16 @@
+# Session token — 敏感且每次會變，不進 git
+his_token.txt
+
+# 暫存檔（一次性分析、測試用）
+tmp_*.json
+tmp_*.jpg
+tmp_*.py
+apis_found.json
+apis_log.txt
+
+# Python 編譯快取
+__pycache__/
+*.pyc
+
+# Claude 本地設定
+.claude/

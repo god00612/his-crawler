@@ -78,10 +78,12 @@ data = json.loads(result.stdout.decode('utf-8'))
 |---|---|---|
 | 護理紀錄 | `get_nursing_records?visitNo=` | 回傳完整住院史，需自行篩選日期 |
 | 醫師交班 | `get_medSummary?visitNo=` | 小資料，直接 await |
-| 治療處置 | `patient_treatments?visitNo=` | 含呼吸補助費等 |
+| 治療處置 | `patient_treatments?visitNo=` | 含呼吸補助費等，見 RT 代碼表 |
 | 累積檢驗 | `query_cumulative_lab_data?visitNo=` | 大資料用 background pattern |
 | 用藥清單 | `patient_drugs?visitNo=` | |
-| 病房名單 | Chrome MCP UI → 攔截 `get_inPatient` | 無法用 visitNo 直接呼叫 |
+| IO 出入量 | `get_io?visitNo=&detail=Y` | 需加 `detail=Y`，MainEventType: INPUT/OUTPUT |
+| 影像/放射報告 | `patient_orders?chartno=` | 需 ChartNo（非 visitNo），含 ReportText |
+| 病房名單 | `get_inPatient?ward=MI`（直接 fetch） | 回傳 VisitNo/RoomBed/PtName |
 
 ### 累積檢驗欄位結構
 
@@ -358,35 +360,92 @@ data = json.loads(result.stdout.decode('utf-8'))
 
 ### 情境六：檢查報告（影像文字報告）
 
-> ⚠️ **待確認**：目前 PACS 流程只能取得影像 JPEG，放射科醫師的文字報告（impression/findings）尚不知道從哪個 API 取得。
+**已確認**：放射科文字報告（impression/findings）在 `patient_orders?chartno=` API 的 `ReportText` 欄位。
 
-**已知**：
-- `get_oracle_pacs_study_list` 回傳的 `StudyDesc` 只是檢查名稱，不含報告內容
-- WADO 只提供影像檔
+**步驟**：
 
-**待確認事項**（回醫院後）：
-- HIS 裡點開影像報告時，瀏覽器發出哪個 API request？
-- 回傳格式是什麼（純文字 / JSON / PDF）？
-- 是否用 `chartno` 或 `ACCESSION_NO` 查詢？
+1. 取 `chartno`（patient_info 回傳 array，取 index 0）：
+   ```javascript
+   const info = await fetch('https://hapi.csh.org.tw/patient_info?visitNo=XXXXXXXX',
+     {credentials:'include'}).then(r=>r.json());
+   const chartno = info[0].ChartNo;
+   ```
+
+2. 取 patient_orders（含報告的影像醫囑）：
+   ```javascript
+   const orders = await fetch(`https://hapi.csh.org.tw/patient_orders?chartno=${chartno}`,
+     {credentials:'include'}).then(r=>r.json());
+   // 篩有報告的影像類，限本次住院（用 VisitNo 過濾）
+   const visitNo = XXXXXXXX;
+   const imaging = orders.filter(o =>
+     o.VisitNo === visitNo &&
+     o.ReportText && o.ReportText.trim().length > 0 &&
+     /CT|CXR|MRI|X-RAY|chest|brain|腹部|胸部|攝影/i.test(o.ItemName||o['醫囑類別']||'')
+   );
+   // 按報告時間排序
+   imaging.sort((a,b) => (b['報告時間']||'').localeCompare(a['報告時間']||''));
+   JSON.stringify(imaging.slice(0,5).map(o=>({
+     item: o.ItemName, date: o['報告時間']?.slice(0,10), report: o.ReportText
+   })));
+   ```
+
+**patient_orders 主要欄位**：
+
+| 欄位 | 說明 |
+|---|---|
+| `ItemName` | 醫囑名稱（如 "Chest PA"、"Brain CT w/o"） |
+| `醫囑類別` | 類別（MRI/一般攝影/CT/生化檢查等） |
+| `ReportText` | 放射科文字報告全文（英文） |
+| `報告時間` | 報告簽出時間 |
+| `執行狀態` | 正式報告 / 初步報告 |
+| `VisitNo` | 就醫 visitNo（跨住院都有，需過濾） |
+| `ItemCode` | 醫囑代碼 |
 
 ---
 
 ### 情境七：IO（輸入 / 輸出量）
 
-> ⚠️ **待確認**：`get_io` API 存在於 22 個自動觸發的 API 清單中，但尚未確認：
-> - 是否支援 `?visitNo=` 直接查詢
-> - 回傳的欄位結構為何
-> - 時間範圍怎麼篩（日期 / 班別）
+**已確認**：`get_io?visitNo=&detail=Y` 直接可用。
 
-**暫用方法**（模式 A，選病人後攔截）：
+**步驟**：
 
+```javascript
+const io = await fetch('https://hapi.csh.org.tw/get_io?visitNo=XXXXXXXX&detail=Y',
+  {credentials:'include'}).then(r=>r.json());
+
+// 篩今日，按班別彙整
+const today = '2026-05-14';
+const todayIO = io.filter(r => r.IO_DT === today.replace(/-/g,''));
+
+// 分 INPUT / OUTPUT
+const input  = todayIO.filter(r => r.MainEventType === 'INPUT');
+const output = todayIO.filter(r => r.MainEventType === 'OUTPUT');
+
+// 加總
+const totalIn  = input.reduce((s,r) => s + (r.Value1||0), 0);
+const totalOut = output.reduce((s,r) => s + (r.Value1||0), 0);
+
+JSON.stringify({
+  totalIn, totalOut, balance: totalIn - totalOut,
+  inputItems:  input.map(r=>({time:r.OccurDate, type:r.EventType, val:r.Value1, unit:r.Unit1})),
+  outputItems: output.map(r=>({time:r.OccurDate, type:r.EventType, val:r.Value1, unit:r.Unit1}))
+});
 ```
-1. form_input 選病人 visitNo → HIS 自動發出 get_io
-2. read_network_requests 取得 get_io 的完整 URL
-3. javascript_tool fetch 該 URL → 檢視回傳結構
-```
 
-回醫院確認後補上完整 SOP 與欄位說明。
+**get_io 欄位結構**：
+
+| 欄位 | 說明 |
+|---|---|
+| `IO_DT` | 日期（`YYYYMMDD` 格式，需去掉 `-`） |
+| `MainEventType` | `INPUT` 或 `OUTPUT` |
+| `Shift` | 班別（白班/小夜班/大夜班） |
+| `OccurDate` | 發生時間（`YYYY-MM-DD HH:mm`） |
+| `EventType` | 細項類型（如 `INPUT.DRINK.MOUTHEAT`） |
+| `Value1` / `Unit1` | 主要數量 / 單位（通常 CC） |
+| `Value2` / `Unit2` | 次要數量（如有） |
+| `ItemName` | 項目名稱 |
+
+> `hasAnyIoData=Y` 只回傳 `{"hasAnyIoData":"Y"}` — 用於檢查是否有資料，不回傳明細。明細需用 `detail=Y`。
 
 ---
 
@@ -522,21 +581,23 @@ MI03 大夜班（2026-05-13 23:00 ~ 2026-05-14 07:00）
 
 **目標**：確認病人是否有開立特定醫囑，例如呼吸器相關 order（代碼 57001）。
 
-> ⚠️ **待確認**：`patient_orders` API 是否支援 `?visitNo=` 直接查，以及欄位結構。
+**已確認**：用 `patient_treatments?visitNo=` 查即時處置醫囑（欄位名稱：`ItemCode`）；`patient_orders?chartno=` 查影像/檢驗/特殊醫囑歷史（包含報告）。
 
-**待確認事項**（回醫院後）：
-- 選病人後攔截 `patient_orders` URL → 確認是否可直接用 `?visitNo=`
-- 回傳欄位中醫囑代碼的欄位名稱（`OrderCode`？`ItemCode`？`OrderNo`？）
-- 篩選方式：用代碼精確比對，或用醫囑名稱關鍵字搜尋
-
-**暫用方向**：
+**即時處置/呼吸治療類（patient_treatments）**：
 ```javascript
-// 取 patient_orders（URL 從 network log 攔截）
-const orders = await fetch('https://hapi.csh.org.tw/patient_orders?encrypted=...&nonce=...',
+const tx = await fetch('https://hapi.csh.org.tw/patient_treatments?visitNo=XXXXXXXX',
   {credentials:'include'}).then(r=>r.json());
-// 篩特定代碼或名稱
-orders.filter(o => o.OrderCode === '57001' || o.OrderName?.includes('呼吸器'));
+// 精確代碼比對
+const target = tx.find(t => t.ItemCode === '57001');
+// 或關鍵字
+const vent = tx.filter(t => /呼吸補助|氣管內管|VEST|HFNC|BiPAP/i.test(t.ItemName||''));
+JSON.stringify(vent.map(t=>({name:t.ItemName, code:t.ItemCode, status:t.TreatStatus})));
 ```
+
+**patient_treatments 欄位**：`ItemCode`（代碼）、`ItemName`（名稱）、`TreatStatus`（使用中/停用）
+
+**常用 RT 醫囑代碼**（見 RT 代碼表）：
+- `57001` 呼吸補助使用費　`5702301` on BiPAP　`57031` HFNC　`47090` VEST　`ZD52` ETT care
 
 ---
 
@@ -560,18 +621,25 @@ orders.filter(o => o.OrderCode === '57001' || o.OrderName?.includes('呼吸器')
    ```
 3. 取 `sop_instance_uid` → PowerShell WADO 下載 → `Read` tool 呈現（同 CXR 流程）
 
-**文字報告部分**：
-> ⚠️ **待確認**（同情境六）：放射科文字報告（findings / impression）的 API 尚未找到。回醫院後在 HIS 點開報告時攔截 network request 確認。
+**文字報告部分**（已確認，同情境六）：
+```javascript
+// patient_orders?chartno= 篩腦部影像報告
+const chartno = info[0].ChartNo;
+const orders = await fetch(`https://hapi.csh.org.tw/patient_orders?chartno=${chartno}`,
+  {credentials:'include'}).then(r=>r.json());
+const brainReports = orders.filter(o =>
+  o.ReportText && /brain|head|CT|MRI|頭部|顱/i.test(o.ItemName||'')
+).sort((a,b)=>(b['報告時間']||'').localeCompare(a['報告時間']||''));
+```
 
 **呈現格式**：
 ```
 Brain CT（2026-05-12）
 [影像]
 
-Brain MRI（2026-05-10）
-[影像]
-
-放射科報告：⚠️ 待確認 API
+放射科報告（2026-05-12）：
+  Findings: ...
+  Impression: 1. No hemorrhage. 2. ...
 ```
 
 ---
@@ -668,8 +736,8 @@ foreach ($pt in $patients) {
     {bed:'CCU01', visitNo:XXXXXXXX},
     // ... CCU 全部病人
   ];
-  const TARGET_CODES = ['57023', '57030', '57031'];
-  const TARGET_NAMES = ['BIPAP', 'HFNC', '高流量'];
+  const TARGET_CODES = ['5702301', '57031', '57030'];  // BiPAP / HFNC daily / HFNC first day
+  const TARGET_NAMES = ['BiPAP', 'HFNC', '高流量', '濕化高流量'];
 
   const results = await Promise.all(patients.map(async pt => {
     const data = await fetch(
@@ -688,20 +756,39 @@ foreach ($pt in $patients) {
 })();
 ```
 
-> ⚠️ **待確認**：57023（BIPAP）、57030、57031（HFNC）是否在 `patient_treatments` 中，還是在 `patient_orders` 中？回醫院後用模式 A（選病人攔截）確認這些代碼出現在哪個 API、欄位名稱為何（`ItemCode`？`OrderCode`？）。
+**已確認**：代碼在 `patient_treatments`，欄位名稱為 `ItemCode`。
+
+**RT 代碼表**（`patient_treatments.ItemCode`）：
+
+| 代碼 | 項目名稱 |
+|---|---|
+| `57001` | 呼吸補助使用費(含氧氣費) 一天（呼吸器/HFNC 均用此收費） |
+| `5700301` | on O2 with Nasal cannula（鼻導管給氧） |
+| `5702301` | on BiPAP（非侵入性正壓呼吸器） |
+| `57021` | 蒸氣或噴霧吸入治療（每次） |
+| `57024` | 呼吸器噴霧吸入治療（每天） |
+| `57031` | 濕化高流量氧氣治療 Daily care（HFNC，第二天後） |
+| `47041` | 呼吸道抽吸 Suction（每次） |
+| `47090` | VEST 高頻胸壁振盪呼吸道清潔 >30 分（HFCWO） |
+| `ZD52` | 氣管內管照護 Endotracheal tube care |
+| `42011` | 物理治療：中度治療-複雜 |
+| `PTM5` | 被動性關節運動 Passive ROM |
+| `PTM6` | 牽拉運動 Stretching |
+
+> 57030（HFNC 首日）預估存在但當日未觀察到（已有 57031 的病人代表已過首日）。
 
 **呈現格式**：
 ```
 CCU 呼吸支持現況（2026-05-14）
 
-使用呼吸器：
+使用呼吸器（57001）：
   CCU01 王OO、CCU05 李OO
 
-使用 BIPAP（57023）：
+使用 BiPAP（5702301）：
   CCU03 張OO
 
-使用 HFNC（57030/57031）：
-  CCU07 陳OO、CCU09 林OO
+使用 HFNC（57031）：
+  SI16 謝OO、SI22 XXX
 ```
 
 ---
@@ -840,8 +927,14 @@ MI06 小夜班特殊處置（2026-05-14 15:00–23:00）
    ```
 3. 取 `sop_instance_uid` → PowerShell WADO 下載 → `Read` tool 呈現
 
-**文字報告（心導管結果、病灶描述）**：
-> ⚠️ **待確認**（同情境六）：放射科/心臟科文字報告 API 尚未找到。回醫院後攔截 network 確認。
+**文字報告（心導管結果、病灶描述）**（已確認，同情境六）：
+```javascript
+const orders = await fetch(`https://hapi.csh.org.tw/patient_orders?chartno=${chartno}`,
+  {credentials:'include'}).then(r=>r.json());
+const cathReports = orders.filter(o =>
+  o.ReportText && /cath|coronary|angio|心導管|冠狀/i.test(o.ItemName||'')
+).sort((a,b)=>(b['報告時間']||'').localeCompare(a['報告時間']||''));
+```
 
 ---
 
@@ -1015,7 +1108,12 @@ MI07 營養狀況（2026-05-14）
 
 ## 呼吸治療師（RT）專用情境
 
-> **共同前提**：呼吸器設定（Mode、FiO2、PEEP、Tidal Volume、Rate、PIP）存在護理**班務記錄**自由文字中，格式因院區而異。以下 SOP 中凡涉及呼吸器設定解析，均需回醫院確認實際記錄格式後調整關鍵字。
+> **共同前提**：呼吸器設定記錄在護理 **VITALSIGN** 型別記錄中（非班務記錄），每小時自動產生一筆。格式如下：
+> ```
+> 呼吸器：機型:EV300, Mode:PACV,呼吸次數:14次/分鐘,氧氣濃度:35％,吐氣末陽壓:8cmH2O,壓力:22cmH2O
+> ```
+> - 篩選方式：`RecordType === 'VITALSIGN'` + `Content` 含 `呼吸器：`
+> - FiO2 → `氧氣濃度`（後接 `％`）；PEEP → `吐氣末陽壓`（後接 `cmH2O`）；Mode → `Mode:`；RR → `呼吸次數`；PC 壓力 → `壓力:`
 
 ---
 
@@ -1066,24 +1164,26 @@ MI07 營養狀況（2026-05-14）
 })();
 ```
 
-**Phase 2 — 對警示床位查護理班務記錄取呼吸器設定**：
+**Phase 2 — 對警示床位查 VITALSIGN 記錄取呼吸器設定**：
 ```javascript
-// 針對 alerts 中每個床位
-window._nursing = null;
-fetch(`https://hapi.csh.org.tw/get_nursing_records?visitNo=XXXXXXXX`,
-  {credentials:'include'}).then(r=>r.json()).then(d=>{window._nursing=d;});
-// 篩今日最新班務，找 Mode/FiO2/PEEP 關鍵字
+// 針對 alerts 中每個床位，取今日最新 VITALSIGN 呼吸器設定
 (() => {
   const today = '2026-05-14';
   return window._nursing
-    .filter(r => r.RecordTime.startsWith(today) && r.RecordTypeName?.includes('班務'))
+    .filter(r => r.RecordTime.startsWith(today) &&
+      r.RecordType === 'VITALSIGN' && (r.Content||'').includes('呼吸器：'))
     .sort((a,b) => b.RecordTime.localeCompare(a.RecordTime))
-    .slice(0,3)
-    .map(r => r.Content);
+    .slice(0,1)
+    .map(r => {
+      const c = r.Content;
+      const mode  = (c.match(/Mode:(\S+)/) || [])[1];
+      const fio2  = (c.match(/氧氣濃度:(\d+)/) || [])[1];
+      const peep  = (c.match(/吐氣末陽壓:(\d+)/) || [])[1];
+      const rate  = (c.match(/呼吸次數:(\d+)/) || [])[1];
+      return `Mode:${mode} FiO2:${fio2}% PEEP:${peep} RR:${rate}`;
+    });
 })()
 ```
-
-> ⚠️ 呼吸器 Mode/FiO2 關鍵字需回醫院確認班務記錄格式。
 
 ---
 
@@ -1154,20 +1254,26 @@ const sputum = window._lab.filter(d =>
   d.TranCode==='8' && /SPT|痰|sputum/i.test(d.SpecimenCode||d.Item||'')
 ).sort((a,b)=>b.LabDate.localeCompare(a.LabDate)).slice(0,2);
 
-// 4. 最新班務記錄（呼吸器設定、管路深度）
-const latestNote = window._nursing
-  .filter(r => r.RecordTypeName?.includes('班務'))
+// 4. 最新 VITALSIGN 呼吸器設定
+const latestVent = window._nursing
+  .filter(r => r.RecordType === 'VITALSIGN' && (r.Content||'').includes('呼吸器：'))
   .sort((a,b)=>b.RecordTime.localeCompare(a.RecordTime))[0];
+
+// 5. 插管日期（TUBE 型別，置入氣管內管）
+const intubRecord = window._nursing
+  .filter(r => r.RecordType === 'TUBE' && /置入.*氣管內管/.test(r.Content||''))
+  .sort((a,b)=>a.RecordTime.localeCompare(b.RecordTime))[0];
+const intubDate = intubRecord?.RecordTime?.slice(0,10);
 ```
 
 **呈現格式**：
 ```
 ═══ RT 交班卡 MI01 王OO ═══
-插管天數：第 5 天（插管日 2026-05-09）
-管路深度：ETT 22 cm（唇齒處）          ← 來自最新班務記錄
+插管天數：第 5 天（插管日 2026-05-09）       ← TUBE 型別 RecordTime
+管路深度：ETT 22 cm                         ← TUBE 型別 Content 解析
 ─────────────────────────────
-呼吸器設定（最新班務）：
-  Mode: SIMV, FiO2: 40%, PEEP: 6, TV: 450, Rate: 12
+呼吸器設定（最新 VITALSIGN，每小時更新）：
+  Mode: PACV, FiO2: 35%, PEEP: 8, RR: 14, 壓力: 22 cmH2O
 ─────────────────────────────
 今早 ABG（08:15）：
   pH 7.38 | pCO2 42 | pO2 88 | HCO3 24 | BE -1
@@ -1177,7 +1283,8 @@ const latestNote = window._nursing
   Klebsiella pneumoniae ⚠ → 藥敏見完整報告
 ```
 
-> ⚠️ 插管日期需從護理紀錄找「插管」關鍵字確認（與入院日期不同）；呼吸器設定解析待確認格式。
+> 插管日期：`RecordType==='TUBE'` + `Content` 含 `置入.*氣管內管` → `RecordTime` 即插管時間。
+> 呼吸器設定：`RecordType==='VITALSIGN'` + `Content` 含 `呼吸器：` → 解析 `氧氣濃度`/`吐氣末陽壓`/`Mode:`。
 
 ---
 
@@ -1199,31 +1306,42 @@ const latestNote = window._nursing
     const nursing = await fetch(
       `https://hapi.csh.org.tw/get_nursing_records?visitNo=${pt.visitNo}`,
       {credentials:'include'}).then(r=>r.json());
-    const latestNote = nursing
-      .filter(r => r.RecordTime.startsWith(today) && r.RecordTypeName?.includes('班務'))
+    // 最新 VITALSIGN 呼吸器設定（每小時更新）
+    const latestVent = nursing
+      .filter(r => r.RecordType === 'VITALSIGN' && (r.Content||'').includes('呼吸器：'))
       .sort((a,b)=>b.RecordTime.localeCompare(a.RecordTime))[0];
-    const content = latestNote?.Content || '';
+    const content = latestVent?.Content || '';
 
-    // 解析條件（關鍵字待確認實際格式）
-    const fio2Match  = content.match(/FiO2[:\s]*(\d+)/i);
-    const peepMatch  = content.match(/PEEP[:\s]*(\d+)/i);
+    // 解析（已確認格式：氧氣濃度/吐氣末陽壓）
+    const fio2Match  = content.match(/氧氣濃度:(\d+)/);
+    const peepMatch  = content.match(/吐氣末陽壓:(\d+)/);
     const fio2  = fio2Match  ? parseInt(fio2Match[1])  : null;
     const peep  = peepMatch  ? parseInt(peepMatch[1])  : null;
-    const noVaso = !/norepinephrine|epinephrine|dopamine|vasopressin/i.test(content);
+
+    // 插管天數（TUBE 型別）
+    const intubRec = nursing.filter(r=>r.RecordType==='TUBE'&&/置入.*氣管內管/.test(r.Content||''))
+      .sort((a,b)=>a.RecordTime.localeCompare(b.RecordTime))[0];
+    const intubDays = intubRec
+      ? Math.floor((new Date(today) - new Date(intubRec.RecordTime.slice(0,10))) / 86400000)
+      : null;
+
+    // 升壓劑（從班務記錄）
+    const latestNote = nursing.filter(r=>r.RecordTypeName?.includes('班務'))
+      .sort((a,b)=>b.RecordTime.localeCompare(a.RecordTime))[0];
+    const noVaso = !/norepinephrine|epinephrine|dopamine|vasopressin/i.test(latestNote?.Content||'');
 
     return {
       bed: pt.bed, name: pt.name,
-      fio2, peep, noVaso,
-      candidate: fio2 <= 40 && peep <= 5 && noVaso
+      fio2, peep, intubDays, noVaso,
+      candidate: fio2 != null && fio2 <= 40 && peep != null && peep <= 5 &&
+                 intubDays != null && intubDays >= 2 && noVaso
     };
   }));
 
   return results.filter(r=>r.candidate)
-    .map(r=>`${r.bed} ${r.name}: FiO2=${r.fio2}% PEEP=${r.peep} 無升壓劑`);
+    .map(r=>`${r.bed} ${r.name}: FiO2=${r.fio2}% PEEP=${r.peep} 插管第${r.intubDays}天 無升壓劑`);
 })();
 ```
-
-> ⚠️ FiO2/PEEP 解析的正規表達式需回醫院確認班務記錄的實際寫法。插管天數計算需先確認插管日期的記錄方式。
 
 ---
 

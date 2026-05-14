@@ -140,7 +140,42 @@ return JSON.stringify(results);
 ```
 
 **Getting ward list via Chrome MCP** (no Playwright needed):
-Use `find` + `form_input` to select unit in the 更換名單 UI, click 確定名單, then `read_network_requests` to capture the `get_inPatient` URL, and fetch it to get all patients with `VisitNo`/`RoomBed`/`PtName`. The `form_input` tool triggers the Vue change handler correctly (unlike raw `dispatchEvent`).
+Direct fetch works: `get_inPatient?ward=MI` returns all patients with `VisitNo`/`RoomBed`/`PtName`. No UI interaction needed.
+
+**get_io API** (confirmed):
+- URL: `get_io?visitNo=XXXXXXXX&detail=Y` (requires `detail=Y`, NOT just visitNo)
+- `hasAnyIoData=Y` only checks existence, returns `{"hasAnyIoData":"Y"}`, not detail
+- Fields: `IO_DT`(YYYYMMDD), `MainEventType`(INPUT/OUTPUT), `Shift`, `OccurDate`, `EventType`, `Value1`, `Unit1`, `Value2`, `Unit2`, `ItemName`
+
+**patient_orders API** (confirmed):
+- URL: `patient_orders?chartno=XXXXXX` (requires `ChartNo` from `patient_info[0].ChartNo`, NOT visitNo)
+- Returns ALL orders across all admissions — filter by `VisitNo` for current admission
+- Key field: `ReportText` contains full radiology/pathology text reports (English)
+- Other fields: `ItemName`, `醫囑類別`, `ItemCode`, `報告時間`, `執行狀態`
+- 醫囑類別 values: MRI, 一般攝影, CT, 生化檢查, 血液檢查, 細菌檢查, etc.
+
+**patient_info returns array** (confirmed):
+- Response is array-like: access as `info[0].ChartNo`, not `info.ChartNo`
+
+**Ventilator settings in nursing records** (confirmed):
+- Record type: `VITALSIGN` (NOT 班務記錄)
+- Format: `呼吸器：機型:EV300, Mode:PACV,呼吸次數:14次/分鐘,氧氣濃度:35％,吐氣末陽壓:8cmH2O,壓力:22cmH2O`
+- Keywords: `氧氣濃度`=FiO2, `吐氣末陽壓`=PEEP, `呼吸次數`=RR, `壓力`=PC pressure, `Mode:`=mode
+- Generated hourly automatically
+
+**Intubation date in nursing records** (confirmed):
+- Record type: `TUBE`
+- Keyword: `置入.*氣管內管` in Content
+- `RecordTime` = intubation datetime
+
+**RT treatment codes** (patient_treatments.ItemCode, confirmed):
+- `57001` 呼吸補助使用費 (ventilator/HFNC general)
+- `5700301` on O2 with Nasal cannula
+- `5702301` on BiPAP
+- `57024` 呼吸器噴霧吸入治療/天　`57021` 噴霧吸入/次
+- `57031` 濕化高流量氧氣治療 Daily care (HFNC, day 2+)
+- `47041` Suction　`47090` VEST/HFCWO　`ZD52` ETT care
+- `42011` 物理治療:中度治療-複雜　`PTM5` Passive ROM　`PTM6` Stretching
 
 **Selecting a patient fires all 22 APIs at once**: Use `form_input` to select a patient's `visitNo` in the patient dropdown — HIS immediately fires all background API calls. Capture all URLs via `read_network_requests` and fetch whichever ones are needed. This replaces the Playwright 15-second wait loop entirely. The 22 APIs include: `patient_info`, `visit_history`, `get_io`, `get_pump_records`, `get_personal_note`, `patient_treatments`, `get_vital_sign`, `patient_body_record`, `get_pre_admin_orders`, `get_pharmacyReview_record`, `patient_orders`, `get_medSummary`, `get_nursing_records`, `patient_problems`, `med_allergy`, `allergy_cloud_query`, `patient_drugs`, `query_cumulative_lab_data`.
 

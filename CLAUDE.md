@@ -213,7 +213,29 @@ Main page table has one row per patient. Column index:
 
 **APIs** (POST, need Authorization header):
 - `/api/RtStatus/List` — machine status list (body params TBD)
-- `/api/rtRecord/getRtRrecordList` — RT care records (body params TBD, empty body returns [])
+- `/api/rtRecord/getRtRrecordList` — RT care records; body is `application/x-www-form-urlencoded` (not JSON)
+
+**`getRtRrecordList` body params** (form-urlencoded, captured from live session):
+```
+pSDate=2026-05-03 00:00      # query start date (YYYY-MM-DD HH:MM)
+pEDate=2026-05-16 23:59      # query end date
+pipd_no=                      # empty OK
+pId=                          # empty OK
+payload[user_id]=X591         # from JWT in sessionStorage.Authorization
+payload[user_name]=賴泓源     # from JWT
+payload[role]=RT              # from JWT
+payload[token_time]=          # empty OK
+payload[user_not_edit_role]=false
+pat_info[machine][ipd_no]=33958572     # visitNo of patient
+pat_info[machine][chart_no]=2048535    # chartNo of patient
+pat_info[machine][RECORD_ID]=...       # most recent RT record ID (from rtStatus list)
+pat_info[machine][RECORDDATE]=...      # most recent RT record datetime
+pat_info[machine][hasData]=true
+pat_info[machine][device]=EvitaV500   # current device (from rtStatus list)
+pat_info[machine][mode]=PC-AC         # current mode (from rtStatus list)
+# ... all other pat_info[machine][*] fields from rtStatus list response
+```
+**Shortcut**: reuse the body captured via XHR interceptor from the live Maya page click (see SKILL.md).
 
 **`getRtRrecordList` response**: array of records. Each record has a `rt_record` sub-object with all measured/set values. Field name mapping (Maya screen → `rt_record` key):
 

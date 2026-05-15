@@ -1204,49 +1204,85 @@ JSON.stringify(latest, null, 2);
 
 > 系統說明、登入流程、欄位對應表見 CLAUDE.md Maya RCS 段落。
 
-**取得方式：直接 fetch() POST + Bearer token**（在已登入的 Maya tab 用 `javascript_tool` 執行）：
+**取得方式：XHR 攔截 + JS 點擊病人列**（在已登入的 Maya tab 用 `javascript_tool` 執行）
+
+`getRtRrecordList` 的 body 是 form-urlencoded，且需帶完整 `pat_info[machine]` 物件（含 RECORD_ID、RECORDDATE 等欄位），無法簡單地手工組 body。最可靠的方式是讓 Maya 頁面自己發出請求並攔截：
+
+**Step 1：設定 XHR 攔截器 + 點擊病人**
 
 ```javascript
-(async function() {
-  const token = sessionStorage.getItem('Authorization');
-  const today = new Date().toISOString().slice(0,10);
-  const arr = await fetch('http://maya-ap/RCS_CSH/api/rtRecord/getRtRrecordList', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json', 'Authorization': token},
-    credentials: 'include',
-    body: JSON.stringify({pSDate: today+' 00:00', pEDate: today+' 23:59', pipd_no: '', pId: ''})
-  }).then(r => r.json());
+// 攔截器
+window._capturedXHR = [];
+const origOpen = XMLHttpRequest.prototype.open;
+const origSend = XMLHttpRequest.prototype.send;
+XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+  this._url = url; return origOpen.apply(this, [method, url, ...rest]);
+};
+XMLHttpRequest.prototype.send = function(body) {
+  if (this._url?.includes('getRtRrecordList'))
+    window._capturedXHR.push({url: this._url, body});
+  return origSend.apply(this, arguments);
+};
 
-  // 依 ipd_no 篩選病人，取最新一筆
-  const pat = arr.filter(r => r.ipd_no === '<ipd_no>');
-  pat.sort((a,b) => (b.RECORDDATE||'').localeCompare(a.RECORDDATE||''));
-  const rec = pat[0]?.rt_record || pat[0];
-  if (!rec) return '無資料';
-
-  // 用 API 欄位取值，輸出用 Maya 畫面顯示名稱
-  return [
-    `記錄時間：${pat[0].RECORDDATE}`,
-    `Ventilation Mode：${rec.mode}`,
-    `FiO2 (%)：${rec.fio2_set}`,
-    `PEEP / PEEPi：${rec.pressure_peep} /`,
-    `PS / PC：${rec.pressure_ps || ''} / ${rec.pressure_pc || ''}`,
-    `Set RR / Pt：${rec.vr_set || ''} / ${rec.vr || ''}`,
-    `Ti / I:E ratio：${rec.insp_time || ''} / ${rec.ie_ratio || ''}`,
-    `VT insp / exp：${rec.vt} / ${rec.exp_tv}`,
-    `MV：${rec.mv}`,
-    `PIP / Pplat / Pmean：${rec.pressure_peak} / ${rec.pressure_pplat || ''} / ${rec.pressure_mean}`,
-    `Cdyn / Res：${rec.Compliance} / ${rec.resistance}`,
-    `Heart rate：${rec.pulse}`,
-    `BP (S/D)：${rec.bps} / ${rec.bpd}`,
-    `SpO2：${rec.spo2}`,
-    `Humidifier temp：${rec.humi_temp}`,
-    `E.T. Tube：${rec.artificial_airway_type}`,
-    `E.T size / mark：${rec.et_size} / ${rec.et_mark}`,
-    `Sensitivity：${rec.sensitivity_flow}`,
-  ].join('\n');
-})()
+// 點擊目標病人列（例如 MI01）
+const rows = document.querySelectorAll('tr');
+for (const row of rows) {
+  if (row.textContent.includes('MI01')) {
+    (row.querySelectorAll('td')[1] || row).click(); break;
+  }
+}
+'interceptor set + clicked';
 ```
-注意：HIS 用 GET + cookie；Maya 用 POST + Bearer token + cookie。兩者都是直接 fetch()，差異只在 method 與 header。PowerShell 因無 session cookie → `[]`。
+
+**Step 2：用同一個 body 重打，取完整記錄**
+
+```javascript
+// 確認攔截成功
+window._capturedXHR.length + ' xhr captured';
+// → 應為 "1 xhr captured"
+
+// 重打 API，取 14 天記錄
+const body = window._capturedXHR[0].body;
+const token = sessionStorage.getItem('Authorization');
+fetch('/RCS_CSH/api/rtRecord/getRtRrecordList', {
+  method: 'POST',
+  headers: {'Content-Type':'application/x-www-form-urlencoded', 'Authorization': token},
+  credentials: 'include',
+  body
+}).then(r=>r.json()).then(d=>{ window._rtRecords = d; });
+'firing...';
+```
+
+**Step 3：讀取並格式化**
+
+```javascript
+// 確認筆數
+window._rtRecords?.length + ' 筆';
+
+// 取最新一筆並格式化
+const all = window._rtRecords;
+all.sort((a,b) => (b.RECORDDATE||'').localeCompare(a.RECORDDATE||''));
+const rec = all[0]?.rt_record;
+if (!rec) '無資料';
+else [
+  `記錄時間：${all[0].RECORDDATE}`,
+  `Mode：${rec.mode}`,
+  `FiO2：${rec.fio2_set}%`,
+  `PEEP：${rec.pressure_peep} cmH2O`,
+  `PC / PS：${rec.pressure_pc || ''} / ${rec.pressure_ps || ''} cmH2O`,
+  `Set RR / Pt：${rec.vr_set || ''} / ${rec.vr || ''} 次/分`,
+  `Ti / I:E：${rec.insp_time || ''} / ${rec.ie_ratio || ''}`,
+  `VT insp / exp：${rec.vt} / ${rec.exp_tv} mL`,
+  `MV：${rec.mv} L/min`,
+  `PIP / Pmean：${rec.pressure_peak} / ${rec.pressure_mean} cmH2O`,
+  `Cdyn / Res：${rec.Compliance} / ${rec.resistance}`,
+  `SpO2：${rec.spo2}%  HR：${rec.pulse}  BP：${rec.bps}/${rec.bpd}`,
+  `HH temp：${rec.humi_temp}°C`,
+  `人工氣道：${rec.artificial_airway_type} ${rec.et_size}`,
+].join('\n');
+```
+
+注意：`body` 為 form-urlencoded（非 JSON）；PowerShell 因無 session cookie 無法使用。
 
 ---
 
@@ -2251,14 +2287,14 @@ JSON.stringify(window._ward.map(p=>({bed:p.RoomBed, name:p.PtName, visitNo:p.Vis
 | 床位 | visitNo  | | 床位 | visitNo  |
 |------|----------|-|------|----------|
 | MI01 | 33958572 | | MI12 | 34360527 |
-| MI02 | 34472131 | | MI13 | 34459974 |
+| MI02 | 34472131 | | MI13 | 34472121 |
 | MI03 | 34450442 | | MI15 | 34307995 |
-| MI05 | 34115258 | | MI18 | 34360938 |
-| MI06 | 34332529 | | MI19 | 34468550 |
-| MI07 | 34321454 | | MI20 | 34476508 |
-| MI08 | 34360844 | | MI21 | 34199589 |
-| MI09 | 34286021 | | MI22 | 34361865 |
-| MI10 | 34349044 |
+| MI05 | 34115258 | | MI16 | 34396124 |
+| MI06 | 34332529 | | MI17 | 34482531 |
+| MI07 | 34321454 | | MI18 | 34360938 |
+| MI08 | 34360844 | | MI20 | 34476508 |
+| MI09 | 34286021 | | MI21 | 34199589 |
+| MI10 | 34349044 | | MI22 | 34361865 |
 | MI11 | 34317627 |
 
 ### 查詢模式

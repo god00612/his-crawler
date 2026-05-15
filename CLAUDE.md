@@ -215,6 +215,43 @@ Main page table has one row per patient. Column index:
 - `/api/RtStatus/List` — machine status list (body params TBD)
 - `/api/rtRecord/getRtRrecordList` — RT care records (body params TBD, empty body returns [])
 
+**`getRtRrecordList` response**: array of records. Each record has a `rt_record` sub-object with all measured/set values. Field name mapping (Maya screen → `rt_record` key):
+
+| Maya 畫面欄位 | `rt_record` key |
+|---|---|
+| Ventilator Type | `device` |
+| Ventilation Mode | `mode` |
+| FiO2 (%) | `fio2_set` |
+| PEEP | `pressure_peep` |
+| PS / PC | `pressure_ps` / `pressure_pc` |
+| Set VT | `vt_set` |
+| Set RR / Pt (measured total RR) | `vr_set` / `vr` |
+| Ti / I:E ratio | `insp_time` / `ie_ratio` |
+| **VT insp** | **`vt`** |
+| **VT exp** | **`exp_tv`** |
+| MV | `mv` |
+| PIP / Pplat / Pmean | `pressure_peak` / `pressure_pplat` / `pressure_mean` |
+| Cdyn | `Compliance` |
+| Res | `resistance` |
+| Humidifier temp | `humi_temp` |
+| E.T. Tube type | `artificial_airway_type` |
+| E.T size / mark | `et_size` / `et_mark` |
+| Cuff pressure | `cuff` |
+| Breath sound | `breath_sound` |
+| SpO2 | `spo2` |
+| Heart rate (pulse) | `pulse` |
+| BP (S/D) | `bps` / `bpd` |
+
+**CRITICAL — 欄位名稱（已由 rtRecordList.txt vs getRtRrecordList.txt 雙檔交叉驗證）**：
+- `VTinsp`/`VTexp` 欄位不存在；正確為 `vt`（吸氣）/ `exp_tv`（吐氣）
+- `Cdyn` 對應 `Compliance`（大寫 C）
+- `Pplat` 對應 `pressure_pplat`
+- `Pt`（病人自觸 RR）= `vr`；`Set RR` = `vr_set`
+
+**取得方式**：直接 fetch()，POST + Bearer token + cookie。可執行範本見 SKILL.md Maya RCS 段落。
+
+注意：HIS 用 GET + cookie；Maya 用 POST + Bearer token + cookie。PowerShell 因無 session cookie → `[]`。
+
 **Vuex state** in `sessionStorage.vuex`: `RT.patList[]` contains `machine.ipd_no`/`machine.chart_no` per patient (most numeric fields null — DOM is the authoritative source).
 
 **Selecting a patient fires all 22 APIs at once**: Use `form_input` to select a patient's `visitNo` in the patient dropdown — HIS immediately fires all background API calls. Capture all URLs via `read_network_requests` and fetch whichever ones are needed. This replaces the Playwright 15-second wait loop entirely. The 22 APIs include: `patient_info`, `visit_history`, `get_io`, `get_pump_records`, `get_personal_note`, `patient_treatments`, `get_vital_sign`, `patient_body_record`, `get_pre_admin_orders`, `get_pharmacyReview_record`, `patient_orders`, `get_medSummary`, `get_nursing_records`, `patient_problems`, `med_allergy`, `allergy_cloud_query`, `patient_drugs`, `query_cumulative_lab_data`.

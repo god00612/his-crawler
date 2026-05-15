@@ -89,33 +89,12 @@ data = json.loads(result.stdout.decode('utf-8'))
 | 病人位置/床位 | `get_bed_records?chartno=` | 需 ChartNo，DischargeTime==='' 為目前床位 |
 | 病房名單 | `get_inPatient?ward=MI`（直接 fetch） | 回傳 VisitNo/RoomBed/PtName |
 
-### 累積檢驗欄位結構
-
-每筆檢驗紀錄包含：
-
-| 欄位 | 說明 |
-|---|---|
-| `organ_system` | 器官系統分類（見下方） |
-| `item` | 項目名稱（來自 `ShortName`） |
-| `value` | 數值（TranCode 9）或空字串（TranCode 8 培養） |
-| `unit` | 單位 |
-| `ref` | 參考值範圍 |
-| `report` | 培養/鏡檢文字報告（TranCode 8）或空字串 |
-| `abnormal` | `true`/`false` |
-| `lab_date` | 報告日期 |
-
-**器官系統分類**：心臟、腎臟、肝臟、胰臟、血液、凝血、感染、代謝、電解質、ABG、尿液、微生物、感染血清、甲狀腺、鐵代謝、內分泌、其他
-
-### 檢驗結果呈現格式（兩段式）
-
-1. **第一段：原始報告** — 按 HIS 分類（生化/血液/血清/ABG/尿液/微生物等）各一張表，列出**全部項目**（含正常值），異常加 ⚠。同一項目多次測量用「→」表示趨勢。
-2. **第二段：器官系統彙整** — 只列**異常項目**，按器官系統歸類，文字描述趨勢。
-
 ### ⚠️ 重要提醒
 
-- **Pump 速率（ml/hr）在護理「班務記錄」的自由文字裡**，格式例如 "FENTANYL 維持 0.5 ml/hr"。`pump記錄` 欄位通常回傳 0 筆，不要從那裡找。
-- **`get_nursing_records?visitNo=` 回傳完整住院史**（非只有當班）。直接用 `?visitNo=` fetch 後自行篩選日期即可，不需 encrypted URL。
-- **`交班紀錄` = 醫師交班**。是 `get_medSummary` API 的回傳，不是藥物摘要。
+- Pump 速率在護理「班務記錄」自由文字（`pump記錄` API 通常為空）
+- `get_nursing_records?visitNo=` 回傳完整住院史，自行篩選日期
+- `交班紀錄` = `get_medSummary` API（醫師交班，非藥物）
+- 檢驗欄位結構、器官系統分類見 CLAUDE.md
 
 ## 臨床情境 SOP
 
@@ -1174,72 +1153,53 @@ MI07 營養狀況（2026-05-14）
 
 ## 呼吸治療師（RT）專用情境
 
-### Maya RCS 系統（呼吸治療資訊管理系統）
+### Maya RCS 呼吸照護紀錄
 
-**系統位置**：`http://maya-ap/RCS_CSH/`（院內網路，與 HIS 獨立）
+> 系統說明、登入流程、欄位對應表見 CLAUDE.md Maya RCS 段落。
 
-**登入流程（Chrome MCP）**：
+**取得方式：直接 fetch() POST + Bearer token**（在已登入的 Maya tab 用 `javascript_tool` 執行）：
+
 ```javascript
-// 1. 導航到登入頁
-// navigate tabId to: http://maya-ap/RCS_CSH/index.html#/Login
+(async function() {
+  const token = sessionStorage.getItem('Authorization');
+  const today = new Date().toISOString().slice(0,10);
+  const arr = await fetch('http://maya-ap/RCS_CSH/api/rtRecord/getRtRrecordList', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json', 'Authorization': token},
+    credentials: 'include',
+    body: JSON.stringify({pSDate: today+' 00:00', pEDate: today+' 23:59', pipd_no: '', pId: ''})
+  }).then(r => r.json());
 
-// 2. 填帳號密碼並點登入（Vue SPA，用 form_input + button.click()）
-// read_page → ref_1=帳號, ref_2=密碼, ref_3=登入按鈕
+  // 依 ipd_no 篩選病人，取最新一筆
+  const pat = arr.filter(r => r.ipd_no === '<ipd_no>');
+  pat.sort((a,b) => (b.RECORDDATE||'').localeCompare(a.RECORDDATE||''));
+  const rec = pat[0]?.rt_record || pat[0];
+  if (!rec) return '無資料';
 
-// 3. 登入後取 Bearer token
-const token = sessionStorage.getItem('Authorization');  // 'Bearer eyJ...'
-
-// 4. 後續 API 呼叫需帶此 header
-headers: {'Content-Type':'application/json', 'Authorization': token}
+  // 用 API 欄位取值，輸出用 Maya 畫面顯示名稱
+  return [
+    `記錄時間：${pat[0].RECORDDATE}`,
+    `Ventilation Mode：${rec.mode}`,
+    `FiO2 (%)：${rec.fio2_set}`,
+    `PEEP / PEEPi：${rec.pressure_peep} /`,
+    `PS / PC：${rec.pressure_ps || ''} / ${rec.pressure_pc || ''}`,
+    `Set RR / Pt：${rec.vr_set || ''} / ${rec.vr || ''}`,
+    `Ti / I:E ratio：${rec.insp_time || ''} / ${rec.ie_ratio || ''}`,
+    `VT insp / exp：${rec.vt} / ${rec.exp_tv}`,
+    `MV：${rec.mv}`,
+    `PIP / Pplat / Pmean：${rec.pressure_peak} / ${rec.pressure_pplat || ''} / ${rec.pressure_mean}`,
+    `Cdyn / Res：${rec.Compliance} / ${rec.resistance}`,
+    `Heart rate：${rec.pulse}`,
+    `BP (S/D)：${rec.bps} / ${rec.bpd}`,
+    `SpO2：${rec.spo2}`,
+    `Humidifier temp：${rec.humi_temp}`,
+    `E.T. Tube：${rec.artificial_airway_type}`,
+    `E.T size / mark：${rec.et_size} / ${rec.et_mark}`,
+    `Sensitivity：${rec.sensitivity_flow}`,
+  ].join('\n');
+})()
 ```
-
-**最可靠的資料取得方式：DOM 解析**（登入後主畫面已渲染完整清單）
-```javascript
-// 主畫面 URL: #/Main/RT/rtStatus/List/YYYYMMDDHHMMSS
-const rows = [...document.querySelectorAll('table tbody tr')];
-const data = rows.map(r => {
-  const cells = [...r.querySelectorAll('td')].map(td => td.innerText.trim().replace(/\s+/g,' '));
-  if (cells.length < 7) return null;
-  const ventRaw = cells[7] || '';
-  return {
-    bed:      cells[1],
-    chartno:  cells[2],
-    name:     cells[3].replace(/^住\s*/,''),
-    age:      cells[4],
-    diag:     cells[5],
-    mvDays:   cells[6],          // MV 天數
-    device:   ventRaw.split(' ')[0],   // 機器型號（EvitaV300/V500/Prisma50c等）
-    settings: ventRaw.replace(/^\S+\s*/,''), // PC:xx PEEP:xx Set RR:xx FiO2:xx
-    hhDate:   cells[8],          // HH（加溫濕化器）更換日期
-    tubeDate: cells[9],          // 換管日期
-    remark:   cells[10]          // 完整備註（含治療計畫、異常檢驗、CXR等）
-  };
-}).filter(r => r && r.bed);
-
-// 篩 MI 病房
-data.filter(p => p.bed?.startsWith('MI'));
-```
-
-**DOM 欄位說明**：
-
-| 欄位 | 說明 | 範例 |
-|---|---|---|
-| `device` | 呼吸器型號 | EvitaV300/EvitaV500/Prisma50c/NC/SM |
-| `settings` | 完整呼吸器設定字串 | `PC: 24 PEEP: 8.0 Set RR: 18 FiO2: 40` |
-| `mvDays` | 累積 MV 天數 | `72` |
-| `hhDate` | HH 更換日期 | `2026-03-11` |
-| `tubeDate` | 換管日期 | `2026-03-18` |
-| `remark` | RT 備註（治療計畫/CXR/Lab/會議紀錄） | 自由文字，最完整 |
-
-**Vuex state 備用**（settings 多數為 null，以 DOM 為主）：
-```javascript
-const vuex = JSON.parse(sessionStorage.getItem('vuex') || '{}');
-const patList = vuex?.RT?.patList || [];  // 含 machine.ipd_no / machine.chart_no 等
-```
-
-**API 端點**（需 Bearer token，body 格式待完整確認）：
-- `POST /api/RtStatus/List` → 機器狀態清單
-- `POST /api/rtRecord/getRtRrecordList` → 呼吸照護紀錄單（空 body 回傳 []，需帶參數）
+注意：HIS 用 GET + cookie；Maya 用 POST + Bearer token + cookie。兩者都是直接 fetch()，差異只在 method 與 header。PowerShell 因無 session cookie → `[]`。
 
 ---
 
@@ -2216,15 +2176,9 @@ const events = postProc.map(r=>`[${r.RecordTime.slice(11,16)}] ${r.RecordTypeNam
 
 ## Chrome MCP 直接查詢（首選方式）
 
-當使用者的 HIS 網頁已開啟（`hapi.csh.org.tw`），優先用 Chrome MCP 的 `javascript_tool` 直接呼叫 API，**不需要開新的 Playwright 瀏覽器**，速度更快。
+> 前置條件、原理見 CLAUDE.md Chrome MCP 段落。Tab 須在 `hapi.csh.org.tw`（非 `his.csh.org.tw`）。
 
-### 前置條件
-
-1. Chrome MCP 已連接（`list_connected_browsers` 可看到瀏覽器）
-2. 有一個 tab 在 `hapi.csh.org.tw` 網域（⚠️ 不是 `his.csh.org.tw`，會 CORS 失敗）
-3. 已知病人的 `visitNo`（見下方取得方式）
-
-### 取得病房名單與 visitNo（Chrome MCP UI 操作）
+### 取得病房名單與 visitNo
 
 不需要 Playwright。直接在現有 HIS 瀏覽器操控 UI：
 
@@ -2372,74 +2326,11 @@ window._lab ? window._lab.length + ' records' : 'still loading...';
 |------|------|
 | Chrome MCP 未連接 | fallback 到 `python his_query.py --bed MIxx` |
 
----
-
-## PACS 影像查詢（在對話中顯示 X 光）
-
-### 完整流程（三步驟）
-
-**Step 1 — 取得影像清單**（需要 `chartno`，來自 `patient_info` 的 `ChartNo` 欄位）：
-
-```javascript
-// 在 hapi.csh.org.tw tab 執行
-const studies = await fetch(
-  'https://hapi.csh.org.tw/get_oracle_pacs_study_list?chartno=2937482',
-  {credentials:'include'}).then(r=>r.json());
-// 每筆包含：ACCESSION_NO, StudyDesc, StudyDateTime
-JSON.stringify(studies.slice(0,5));
-```
-
-> ⚠️ 只能用 `chartno`，不能用 `visitNo`（API 會拒絕）。日期格式 `YYYY-MM-DD`，不是 `YYYYMMDD`。
-
-**Step 2 — 取得 SOP instance UID**（需 `chartno` + `dt` 日期 YYYY-MM-DD）：
-
-```javascript
-const imgs = await fetch(
-  'https://hapi.csh.org.tw/get_pacs_images?chartno=2937482&dt=2026-05-13',
-  {credentials:'include'}).then(r=>r.json());
-// 每筆包含 sop_instance_uid
-imgs.map(i=>i.sop_instance_uid);
-```
-
-**Step 3 — 用 PowerShell 下載 JPEG（WADO 不需 cookie，直接可存）**：
-
-```powershell
-$uid = "1.2.392.200036.9107.307.35455.20260513.131829.1031420"
-$url = "https://pacs.csh.org.tw/WebPush/WebPush.dll?PushWADO?requestType=WADO&contentType=image/jpeg&objectUID=$uid&rows=640"
-$resp = Invoke-WebRequest -Uri $url -UseBasicParsing
-[System.IO.File]::WriteAllBytes("D:\Users\YUAN\Desktop\his_crawler\tmp_cxr.jpg", $resp.Content)
-```
-
-然後用 `Read` tool 讀取 `tmp_cxr.jpg` → 影像直接顯示在對話裡。
-
-> ⚠️ 從瀏覽器 fetch `pacs.csh.org.tw` 會被 CORS 擋住，**必須用 PowerShell**。
-
-### ABG 注意事項
-
-此 HIS 的 ABG SpecimenCode 是 `'BLD'`（不是 `BLDA` 或 `BLDV`）。
-篩選 ABG 需用項目名稱關鍵字（pH、pCO2、pO2、HCO3、BE 等），不能單靠 SpecimenCode。
-
----
-
-## 補充查詢（direct fetch）
-
-在 Playwright 瀏覽器 session 中，可用 `page.evaluate` 直接呼叫 HIS API，複用 cookie 不需重新驗證：
-
-```python
-# 查醫師交班紀錄（需知道 visitNo）
-url = "https://hapi.csh.org.tw/get_medSummary?visitNo=34472131"
-resp = await page.evaluate(f"fetch('{url}', {{credentials:'include'}}).then(r=>r.json())")
-
-# 查護理紀錄完整歷史（需從 HIS 頁面取得 encrypted URL）
-url = "https://hapi.csh.org.tw/get_nursing_records?encrypted=...&nonce=..."
-resp = await page.evaluate(f"fetch('{url}', {{credentials:'include'}}).then(r=>r.json())")
-```
-
 ## 已知限制
 
 - `--ward MI` 偶爾回傳 0 位病人（更換名單 UI flow 偶爾失敗，重試即可）
-- `get_nursing_records` 只回傳**當班**護理紀錄
-- `get_pump_records` 通常為空，pump 速率要從護理班務記錄的自由文字解讀
+- `get_nursing_records?encrypted=...` 只回傳當班；改用 `?visitNo=` 可取完整住院史
+- `get_pump_records` 通常為空，pump 速率在護理班務記錄的自由文字
 
 ## Troubleshooting
 

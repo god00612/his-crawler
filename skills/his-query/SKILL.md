@@ -1151,6 +1151,53 @@ MI07 營養狀況（2026-05-14）
 
 ---
 
+### 情境二十一：跨團隊照護紀錄
+
+**目標**：取得營養師、社工、物理治療、出院準備、呼吸治療、安寧療護等各團隊的 SBAR 紀錄。
+
+**步驟**：
+
+```javascript
+const data = await fetch('https://hapi.csh.org.tw/get_crossTeamCare_records?visitNo=XXXXXXXX',
+  {credentials:'include'}).then(r=>r.json());
+
+// 依團隊篩選（ShiftTypeName 可為：護理師/醫師/營養師/藥師/呼吸治療/社工/出院準備/安寧療護/物理治療）
+const byTeam = team => data.filter(r => r.ShiftTypeName === team)
+  .sort((a,b) => (b.RecordTime||'').localeCompare(a.RecordTime||''))
+  .map(r => `[${(r.RecordTime||'').slice(0,10)}] ${r.Content}`);
+
+// 取所有團隊最新一筆
+const teams = ['營養師','藥師','呼吸治療','社工','出院準備','安寧療護','物理治療'];
+const latest = {};
+for (const t of teams) {
+  const records = data.filter(r => r.ShiftTypeName === t)
+    .sort((a,b) => (b.RecordTime||'').localeCompare(a.RecordTime||''));
+  if (records.length) latest[t] = records[0];
+}
+JSON.stringify(latest, null, 2);
+```
+
+**呈現格式**：
+```
+【跨團隊照護紀錄】MI01 王OO
+
+營養師（2026-05-13）：
+  S: 病人目前 NG 灌食，目標 1500 kcal...
+  B: 入院診斷肺炎合併敗血症...
+  A: 低白蛋白血症，灌食量未達目標...
+  R: 建議增加灌食速率至 60 ml/hr...
+
+物理治療（2026-05-12）：
+  被動關節運動執行，耐受尚可...
+
+出院準備（2026-05-10）：
+  家屬已告知病況，討論長期照護規劃...
+```
+
+> 若只需特定團隊，直接用 `byTeam('營養師')` 篩選；`get_crossTeamCare_records` 一次回傳所有團隊，不需重複呼叫。
+
+---
+
 ## 呼吸治療師（RT）專用情境
 
 ### Maya RCS 呼吸照護紀錄

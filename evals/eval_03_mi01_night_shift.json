@@ -1,0 +1,12 @@
+{
+  "id": "eval_03_mi01_night_shift",
+  "description": "查詢 MI01 大夜班發生了什麼事，驗證班別篩選與護理紀錄摘要",
+  "input": "MI01 大夜班發生了什麼事？",
+  "requires_network": true,
+  "expected": {
+    "must_contain": ["大夜", "23:"],
+    "must_not_contain": ["error", "無法載入"],
+    "format_check": "應僅呈現 23:00–07:00 的護理紀錄；時間戳記應落在大夜班範圍內；事件應按時序排列"
+  },
+  "notes": "大夜班跨日（23:00 至隔日 07:00），確認跨日篩選邏輯正確"
+}

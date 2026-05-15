@@ -729,6 +729,20 @@ async def _open_ward_list(page, ward_prefix: str) -> list[dict]:
     return sorted(patients, key=lambda x: x["bed"])
 
 
+async def _open_ward_list_with_retry(page, ward_prefix: str, max_retries: int = 2) -> list[dict]:
+    """_open_ward_list 的 retry 包裝：回傳空清單時重新載入頁面再試。"""
+    for attempt in range(max_retries + 1):
+        patients = await _open_ward_list_with_retry(page, ward_prefix)
+        if patients:
+            return patients
+        if attempt < max_retries:
+            print(f"[更換名單] 第 {attempt + 1} 次取得 0 位病人，重試...", file=sys.stderr)
+            await page.goto(_get_his_url())
+            await _login_if_needed(page)
+            await page.wait_for_timeout(2000)
+    return []
+
+
 # ── 公開 API ──────────────────────────────────────────────────
 
 async def fetch_ward_patient_list(ward_prefix: str) -> dict:
@@ -740,7 +754,7 @@ async def fetch_ward_patient_list(ward_prefix: str) -> dict:
         await page.goto(_get_his_url())
         await _login_if_needed(page)
         await page.wait_for_timeout(2000)
-        patients = await _open_ward_list(page, ward_prefix)
+        patients = await _open_ward_list_with_retry(page, ward_prefix)
         await browser.close()
     return {
         "query_type": "ward_list",
@@ -797,7 +811,7 @@ async def fetch_patient_all_data(target_bed: str, shift: str | None = None) -> d
         await _login_if_needed(page)
         await page.wait_for_timeout(2000)
 
-        patients = await _open_ward_list(page, ward_prefix)
+        patients = await _open_ward_list_with_retry(page, ward_prefix)
         if not patients:
             await browser.close()
             return {"query_type": "bed_all", "bed": target_bed, "status": "error",

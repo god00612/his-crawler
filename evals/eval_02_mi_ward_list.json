@@ -1,0 +1,12 @@
+{
+  "id": "eval_02_mi_ward_list",
+  "description": "查詢 MI 病房完整名單，驗證能列出所有床位與病人姓名",
+  "input": "MI 病房現在有哪些病人？",
+  "requires_network": true,
+  "expected": {
+    "must_contain": ["MI01", "MI"],
+    "must_not_contain": ["無法載入", "0 位病人", "error"],
+    "format_check": "應列出至少 5 位以上病人，每筆含床號與姓名；若 retry 機制觸發應在 stderr 看到重試訊息而非直接失敗"
+  },
+  "notes": "此 eval 同時驗證 retry 機制：若第一次取得 0 位病人，應自動重試並成功"
+}

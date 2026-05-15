@@ -1,0 +1,12 @@
+{
+  "id": "eval_04_mi01_abnormal_lab",
+  "description": "查詢 MI01 異常檢驗值，驗證能正確標記異常項目並依器官系統分類",
+  "input": "MI01 最近有哪些異常檢驗值？",
+  "requires_network": true,
+  "expected": {
+    "must_contain": ["⚠", "腎功能", "電解質"],
+    "must_not_contain": ["error", "無法載入", "其他（大量未分類）"],
+    "format_check": "異常項目應標記 ⚠；應按器官系統分類（腎臟/肝臟/電解質/血液等）；數值應含單位與參考範圍"
+  },
+  "notes": "驗證 _organ_system() 分類邏輯與 IsAbnormal 欄位解析是否正確；「其他」分類應不超過總數 20%"
+}

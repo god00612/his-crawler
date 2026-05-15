@@ -1,0 +1,12 @@
+{
+  "id": "eval_01_mi01_vasopressor",
+  "description": "查詢 MI01 目前升壓劑使用情況，驗證能從護理班務記錄正確萃取藥名與速率",
+  "input": "MI01 現在用什麼升壓劑？",
+  "requires_network": true,
+  "expected": {
+    "must_contain": ["norepinephrine", "ml/hr"],
+    "must_not_contain": ["get_pump_records", "無法載入", "error"],
+    "format_check": "應列出藥名、速率（ml/hr 或 mcg/kg/min）、最後記錄時間；來源應為護理班務記錄而非 pump API"
+  },
+  "notes": "MI01 若已出院需換為現有病人床號；升壓劑名稱以實際開立為準"
+}

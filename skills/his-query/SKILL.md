@@ -186,7 +186,7 @@ data = json.loads(result.stdout.decode('utf-8'))
    |---|---|
    | 升壓劑 | norepinephrine、epinephrine、dopamine、vasopressin、levophed |
    | 鎮靜劑 | fentanyl、midazolam、propofol、dexmedetomidine、precedex |
-   | 速率格式 | `X ml/hr`、`X mcg/kg/min` |
+   | 速率格式 | `維持 X ml/hr` 或 `keep X ml/hr`（兩種都要抓） |
 
 3. 交叉確認有無開立（看 `patient_drugs?visitNo=`）。
 
@@ -2233,6 +2233,119 @@ const events = postProc.map(r=>`[${r.RecordTime.slice(11,16)}] ${r.RecordTypeNam
 
 建議：持續監測，若 PIP 再升考慮重複支氣管鏡。
 ```
+
+---
+
+---
+
+### RT-18：RT 交班單（全病房呼吸器病人班際交接）
+
+**觸發條件**：使用者說「幫我列出RT交班單」、「RT交班」等。
+
+> ⚠️ RT交班單 ≠ 病人資料表（一頁式現況卡）。交班單是整個病房的總覽，每床 5 行精簡格式。
+
+**輸出格式（ASCII，每床 5 行，各床之間空一行）**：
+
+```
+╔══════════════════════════════════════════════╗
+║   MI MICU  白班  2026-05-16  共 X 床使用呼吸器  ║
+╚══════════════════════════════════════════════╝
+
+MI01  王OO    N5   Tr    SIMV  PC:22 PEEP:8 FiO2:35 RR:14
+      用藥  Norepinephrine 維持 5 ml/hr；Fentanyl 維持 2 ml/hr
+      事件  ─
+      醫師  維持目前設定，明日評估 SBT
+      計畫  維持現況，觀察脫離可能性
+ 
+MI07  陳OO    N3   ETT   PC-AC  PC:18 PEEP:6 FiO2:40 RR:12
+      用藥  ─
+      事件  ⚠抽痰：黃綠色濃痰量多
+      醫師  !! 5/18 評估拔管
+      計畫  準備拔管，已給 Dexa 前驅處置
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Weaning 中：MI07、MI09
+```
+
+**標記規則**：
+- ETT 類型：氣切 → `Tr`，口插 → `ETT`
+- 各床之間用 ` `（一個空白字元）佔位，防止 markdown 壓縮空白行
+- 醫師重要交班前綴 `!! `（兩個驚嘆號＋空白）
+- 無資料填 `─`
+
+**資料來源優先順序**：
+
+| 欄位 | 來源 |
+|---|---|
+| 床號、姓名、MV天數、機型、模式/設定、ETT類型、計畫/備註 | Maya Vuex `RT.patList[]`（無需 API） |
+| 用藥速率（ml/hr） | HIS 護理**班務記錄**（RecordType=RECORD，今日） |
+| 當班事件 | HIS 護理班務記錄（今日，自由文字解析） |
+| 醫師交班 | `get_medSummary?visitNo=` |
+
+**步驟**：
+
+**Step 1 — 從 Vuex 取呼吸器病人清單（Maya tab，不需 API）**：
+```javascript
+const vuex = JSON.parse(sessionStorage.getItem('vuex') || '{}');
+const mi = (vuex.RT?.patList || [])
+  .filter(p => p.bed_no?.startsWith('MI') && p.machine?.device)
+  .sort((a,b) => a.bed_no.localeCompare(b.bed_no));
+JSON.stringify(mi.map(p => ({
+  bed: p.bed_no,
+  name: p.patient_name,
+  days: p.use_days,
+  settings: (p.show_start_model||'').replace(/^Evita[^,]+,\s*/,''),
+  ett: p.show_ETTube,   // "Tr" 或 "Oral endo"
+  plan: (p.memo||'').match(/【治療計畫】([\s\S]*?)(?=【|$)/)?.[1]?.replace(/\n+/g,' ').trim() || '─',
+  note: (p.memo||'').match(/【備註】([\s\S]*?)(?=【|$)/)?.[1]?.replace(/\n+/g,' ').trim()
+})));
+```
+
+**Step 2 — 護理班務記錄（HIS tab，分批 5–6 床）**：
+```javascript
+// ⚠️ 最多 5-6 個並行，超過會凍結 HIS tab
+const batch = patients.slice(0, 6);
+const results = await Promise.all(batch.map(async p => {
+  const recs = await fetch(`https://hapi.csh.org.tw/get_nursing_records?visitNo=${p.visitNo}`,
+    {credentials:'include'}).then(r=>r.json());
+  const today = '2026-05-16';
+  const notes = recs.filter(r => r.RecordTime?.startsWith(today) && r.RecordTypeName?.includes('班務'));
+  const full = notes.map(r=>r.Content||'').join('\n');
+
+  // 用藥：同時抓「維持」和「keep」兩種格式
+  const drugs = [];
+  const p1 = /(Fentanyl|FENTANYL|Dormicum|Midazolam|Propofol|Norepinephrine|Epinephrine|Dopamine|Vasopressin|Levophed|Genso|Midatin)[^\n]*?維持\s*([\d.]+)\s*ml\/hr/gi;
+  const p2 = /(Fentanyl|FENTANYL|Dormicum|Midazolam|Propofol|Norepinephrine|Epinephrine|Dopamine|Vasopressin|Levophed|Genso|Midatin)[^\n]*?keep\s+([\d.]+)\s*ml/gi;
+  for (const rx of [p1, p2]) {
+    let m;
+    while ((m = rx.exec(full)) !== null)
+      drugs.push(`${m[1]} ${m[2]} ml/hr`);
+  }
+
+  // 事件（注意：「無滑脫」不是滑脫事件）
+  const events = new Set();
+  const cleaned = full.replace(/無滑脫|未滑脫|位置正確.*滑脫/g,'');
+  if (/滑脫/.test(cleaned)) events.add('⚠管路滑脫');
+  if (/氣胸|氣漏/.test(full)) events.add('⚠氣胸/氣漏');
+  if (/低血壓|血壓下降/.test(full)) events.add('⚠血壓下降');
+  if (/出血/.test(full)) events.add('⚠出血');
+  if (/心律不整|VF|VT\b/.test(full)) events.add('⚠心律不整');
+
+  return {bed: p.bed, drugs: drugs.join('；')||'─', events: [...events].join('；')||'─'};
+}));
+```
+
+**Step 3 — 醫師交班（getmedSummary，各床 await）**：
+```javascript
+const med = await fetch(`https://hapi.csh.org.tw/get_medSummary?visitNo=${p.visitNo}`,
+  {credentials:'include'}).then(r=>r.json());
+const latest = med.sort((a,b)=>b.RecordTime.localeCompare(a.RecordTime))[0];
+const drNote = latest?.Summary?.slice(0,80) || '─';
+```
+
+**ETT 標籤對應**：
+- `show_ETTube === "Tr"` → 顯示 `Tr`
+- `show_ETTube === "Oral endo"` 或其他 → 顯示 `ETT`
+- `show_change_tube_time` → **永遠不要顯示**（資料不正確）
 
 ---
 

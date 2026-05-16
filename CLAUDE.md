@@ -53,7 +53,9 @@ All 23 APIs fired when a patient page loads are captured, including: `query_cumu
 **Known API quirks**:
 - `get_medSummary` → 醫師**交班紀錄** (NOT drug data). Fields: `Summary`, `ProgressType`, `RecordUser`, `RecordTime`, `ShiftType`. Parser: `_parse_med_summary()`.
 - `get_nursing_records` → via encrypted URL (intercepted from network) returns only current shift. Via `?visitNo=` returns **full admission history** (10,000+ records for long-stay patients). Filter by date after fetch.
-- `get_pump_records` → often returns 0 records. Actual pump infusion rates (ml/hr) are embedded in nursing **班務記錄** entries as free text (e.g. "FENTANYL 維持 0.5 ml/hr").
+- `get_pump_records` → often returns 0 records. Actual pump infusion rates (ml/hr) are embedded in nursing **班務記錄** entries as free text. Two formats exist — must match both:
+  - `"FENTANYL 維持 0.5 ml/hr"` → regex: `/(藥名)[^\n]*?維持\s*([\d.]+)\s*ml\/hr/gi`
+  - `"Norepinephrine keep 9 ml/hr"` → regex: `/(藥名)[^\n]*?keep\s+([\d.]+)\s*ml/gi`
 
 **Direct fetch pattern** (for supplemental queries inside a running browser session):
 ```python
@@ -151,6 +153,7 @@ Direct fetch works: `get_inPatient?ward=MI` returns all patients with `VisitNo`/
 - URL: `patient_orders?chartno=XXXXXX` (requires `ChartNo` from `patient_info[0].ChartNo`, NOT visitNo)
 - Returns ALL orders across all admissions — filter by `VisitNo` for current admission
 - Key field: `ReportText` contains full radiology/pathology text reports (English)
+- **CXR 日期篩選**：用 `執行時間`（實際拍攝時間），**不要用** `報告時間`（放射科簽報時間，可能晚數小時）。`生效時間` 為下次排程預定日期。
 - Other fields: `ItemName`, `醫囑類別`, `ItemCode`, `報告時間`, `執行狀態`
 - 醫囑類別 values: MRI, 一般攝影, CT, 生化檢查, 血液檢查, 細菌檢查, etc.
 
@@ -212,32 +215,65 @@ Main page table has one row per patient. Column index:
 - `cells[8]` = HH change date, `cells[9]` = tube change date, `cells[10]` = full RT remark
 
 **APIs** (POST, need Authorization header):
-- `/api/RtStatus/List` — machine status list (body params TBD)
-- `/api/rtRecord/getRtRrecordList` — RT care records; body is `application/x-www-form-urlencoded` (not JSON)
+- `/api/RtStatus/List` — **主要使用的 API**，回傳 RT 記錄清單，含完整 `rt_record` 欄位（vt、fio2_set 等）
+- `/api/rtRecord/getRtRrecordList` — 備用，需 server-side session（見下方說明）
 
-**`getRtRrecordList` body params** (form-urlencoded, captured from live session):
-```
-pSDate=2026-05-03 00:00      # query start date (YYYY-MM-DD HH:MM)
-pEDate=2026-05-16 23:59      # query end date
-pipd_no=                      # empty OK
-pId=                          # empty OK
-payload[user_id]=X591         # from JWT in sessionStorage.Authorization
-payload[user_name]=賴泓源     # from JWT
-payload[role]=RT              # from JWT
-payload[token_time]=          # empty OK
-payload[user_not_edit_role]=false
-pat_info[machine][ipd_no]=33958572     # visitNo of patient
-pat_info[machine][chart_no]=2048535    # chartNo of patient
-pat_info[machine][RECORD_ID]=...       # most recent RT record ID (from rtStatus list)
-pat_info[machine][RECORDDATE]=...      # most recent RT record datetime
-pat_info[machine][hasData]=true
-pat_info[machine][device]=EvitaV500   # current device (from rtStatus list)
-pat_info[machine][mode]=PC-AC         # current mode (from rtStatus list)
-# ... all other pat_info[machine][*] fields from rtStatus list response
-```
-**Shortcut**: reuse the body captured via XHR interceptor from the live Maya page click (see SKILL.md).
+**`RtStatus/List` — 完全自動化方式（推薦，已驗證 2026-05-16）**:
 
-**`getRtRrecordList` response**: array of records. Each record has a `rt_record` sub-object with all measured/set values. Field name mapping (Maya screen → `rt_record` key):
+資料來源：`sessionStorage.vuex` → `RT.patList[]` → 找目標床號。
+
+```javascript
+async function getRtDataForBed(bedNo) {
+  const token = sessionStorage.getItem('Authorization');
+  const b64 = token.split('.')[1].replace(/-/g,'+').replace(/_/g,'/');
+  const pl = JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(b64), c=>c.charCodeAt(0))));
+  const vuex = JSON.parse(sessionStorage.getItem('vuex') || '{}');
+  const pat = vuex.RT?.patList?.find(p => p.bed_no === bedNo);
+  if (!pat) return null;
+
+  const m = pat.machine || {};
+  const [recorddate, recordtime] = (m.RECORDDATE || '').split(' ');
+
+  // pat_info = 整個 patList 物件（頂層 + machine 子物件）
+  const patInfoParams = {};
+  for (const [k, v] of Object.entries(pat)) {
+    if (k === 'machine') continue;
+    patInfoParams[`pat_info[${k}]`] = v ?? '';
+  }
+  for (const [k, v] of Object.entries(m)) patInfoParams[`pat_info[machine][${k}]`] = v ?? '';
+  patInfoParams['pat_info[machine][recorddate]'] = recorddate || '';
+  patInfoParams['pat_info[machine][recordtime]'] = recordtime || '';
+  patInfoParams['pat_info[machine][_is_humidifier]'] = m.device || '';
+
+  const body = new URLSearchParams({
+    'before_day': '7', 'search_savetype': '0,1',
+    'pSDate': '2026-05-09', 'pEDate': '2026-05-16',  // 調整日期範圍
+    'payload[user_id]': pl.user_id, 'payload[user_name]': pl.user_name,
+    'payload[role]': 'RT', 'payload[iat]': '',
+    'payload[leader_info][user_id]': '', 'payload[leader_info][user_name]': '',
+    'payload[grp]': '', 'payload[token_time]': '', 'payload[user_not_edit_role]': 'false',
+    'leader_info[user_id]': '', 'leader_info[user_name]': '',
+    ...patInfoParams
+  }).toString();
+
+  const data = await fetch('/RCS_CSH/api/RtStatus/List', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/x-www-form-urlencoded', 'Authorization': token},
+    credentials: 'include', body
+  }).then(r => r.json());
+
+  return Array.isArray(data) ? data : [];
+}
+// 回傳 array，最新記錄在 data[0].rt_record
+```
+
+**關鍵：`pat_info` 必須帶整個 Vuex patList 物件**（含頂層欄位如 `respid`、`PT_NAME`、`artificial_airway_type` 等），不只是 `machine` 子物件。少任何一個頂層欄位 → 回傳 `[]`。
+
+**`getRtRrecordList` — 備用（需 server session，難以自動化）**:
+
+此 API 需要 server 端 session 在有效期內（由 Maya 頁面 click 觸發），直接 fetch 無效。若需要完整歷史記錄（>52 筆），才考慮透過 XHR interceptor 捕捉 body 後 replay。
+
+**`RtStatus/List` response**: array of records. Each record has a `rt_record` sub-object with all measured/set values. Field name mapping (Maya screen → `rt_record` key):
 
 | Maya 畫面欄位 | `rt_record` key |
 |---|---|
@@ -274,7 +310,35 @@ pat_info[machine][mode]=PC-AC         # current mode (from rtStatus list)
 
 注意：HIS 用 GET + cookie；Maya 用 POST + Bearer token + cookie。PowerShell 因無 session cookie → `[]`。
 
-**Vuex state** in `sessionStorage.vuex`: `RT.patList[]` contains `machine.ipd_no`/`machine.chart_no` per patient (most numeric fields null — DOM is the authoritative source).
+**Vuex state** in `sessionStorage.vuex`: `RT.patList[]` contains full patient objects. Each entry has top-level fields (`respid`, `PT_NAME`, `artificial_airway_type`, `hosp_days`, `device`, `mode`, etc.) AND a `machine` sub-object (`ipd_no`, `chart_no`, `RECORD_ID`, `RECORDDATE`, `device`, `mode` — measured values like `vt`/`exp_tv` are null in Vuex, but available in `RtStatus/List` response).
+
+**Vuex rich display fields（無需 API，直接可用）**:
+
+| Vuex 欄位 | 內容 | 備註 |
+|---|---|---|
+| `patient_name` | 病人姓名 | 正確欄位；`PT_NAME` 為 null |
+| `use_days` | MV 天數 | 整數 |
+| `show_start_model` | 呼吸器設定字串 | 格式：`EvitaV300 PC: 24 PEEP: 8.0 Set RR: 18 FiO2: 40`；可用 `.replace(/^Evita[^,]+,\s*/,'')` 去掉機型 |
+| `show_ETTube` | 管路類型 | `"Tr"`（氣切）或 `"Oral endo"`（口插）|
+| `memo` | RT 備註全文 | 含 `【治療計畫】`、`【備註】` 等段落，可用 regex 提取 |
+| `show_change_tube_time` | **⚠️ 不可信** | 此欄位資料錯誤，永遠不要顯示；換管資訊改從護理 TUBE 紀錄取得 |
+
+```javascript
+// RT交班單 — 從 Vuex 取全部呼吸器病人基本資料（不需 API）
+const vuex = JSON.parse(sessionStorage.getItem('vuex') || '{}');
+const mi = (vuex.RT?.patList || [])
+  .filter(p => p.bed_no?.startsWith('MI') && p.machine?.device)
+  .sort((a,b) => a.bed_no.localeCompare(b.bed_no));
+mi.map(p => ({
+  bed: p.bed_no,
+  name: p.patient_name,            // ← 正確欄位（PT_NAME 為 null）
+  days: p.use_days,
+  settings: (p.show_start_model||'').replace(/^Evita[^,]+,\s*/, ''),
+  ett: p.show_ETTube,              // "Tr" 或 "Oral endo"
+  plan: (p.memo||'').match(/【治療計畫】([\s\S]*?)(?=【|$)/)?.[1]?.replace(/\n+/g,' ').trim(),
+  note: (p.memo||'').match(/【備註】([\s\S]*?)(?=【|$)/)?.[1]?.replace(/\n+/g,' ').trim()
+}))
+```
 
 **Selecting a patient fires all 22 APIs at once**: Use `form_input` to select a patient's `visitNo` in the patient dropdown — HIS immediately fires all background API calls. Capture all URLs via `read_network_requests` and fetch whichever ones are needed. This replaces the Playwright 15-second wait loop entirely. The 22 APIs include: `patient_info`, `visit_history`, `get_io`, `get_pump_records`, `get_personal_note`, `patient_treatments`, `get_vital_sign`, `patient_body_record`, `get_pre_admin_orders`, `get_pharmacyReview_record`, `patient_orders`, `get_medSummary`, `get_nursing_records`, `patient_problems`, `med_allergy`, `allergy_cloud_query`, `patient_drugs`, `query_cumulative_lab_data`.
 
@@ -282,6 +346,7 @@ pat_info[machine][mode]=PC-AC         # current mode (from rtStatus list)
 - `document.cookie` blocked by Chrome MCP (privacy protection)
 - `read_network_requests` only captures actual network requests — browser HTTP cache hits are invisible. If an API doesn't appear in the log after selecting a patient, use `?visitNo=` direct fetch instead.
 - After first fetch warms the cache, subsequent fetches for same visitNo return instantly (~1ms)
+- **⚠️ 護理紀錄並行上限**：`get_nursing_records?visitNo=` 最多 5–6 個並行請求；17 個同時送出會凍結 HIS 分頁（需強制重整），改分批（每批 5–6 床）執行。
 
 ### PACS image retrieval
 
